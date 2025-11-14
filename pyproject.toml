@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "beautifulsoup4>=4.14.2",
     "bs4>=0.0.2",
     "fastapi>=0.121.0",
     "html5lib>=1.1",
@@ -14,8 +15,11 @@ dependencies = [
     "numpy>=2.3.4",
     "pandas>=2.3.3",
     "playwright>=1.55.0",
+    "plotly>=6.4.0",
     "pydantic[email]>=2.12.4",
+    "pypdf2>=3.0.1",
     "python-dotenv>=1.2.1",
+    "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
     "uvicorn>=0.38.0",
 ]
