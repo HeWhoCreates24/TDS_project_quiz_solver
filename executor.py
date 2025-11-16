@@ -324,6 +324,8 @@ async def answer_submit(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
         print(f"Submission body: {body}")
         raise
 
+model = "gpt-4.1-nano"
+
 async def call_llm(prompt: str, system_prompt: str = None, max_tokens: int = 2000, temperature: float = 0) -> str:
     """Call LLM with given prompt"""
     if system_prompt is None:
@@ -336,7 +338,7 @@ async def call_llm(prompt: str, system_prompt: str = None, max_tokens: int = 200
         "Content-Type": "application/json",
     }
     json_data = {
-        "model": "gpt-4o-2024-08-06",
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
@@ -447,7 +449,7 @@ OUTPUT ONLY THE JSON PLAN, NO OTHER TEXT.
         "Content-Type": "application/json",
     }
     json_data = {
-        "model": "gpt-4o-2024-08-06",
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
