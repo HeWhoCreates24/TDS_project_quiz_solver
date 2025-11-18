@@ -48,13 +48,12 @@ class QuizRun:
     """Tracks all attempts for a single quiz URL with time-based retry window"""
     def __init__(self, quiz_url: str):
         self.quiz_url = quiz_url
-        self.first_attempt_time = None
+        self.first_attempt_time = time.time()  # Start timer immediately when quiz is received
         self.attempts = []
         self.current_attempt = None
         
     def start_attempt(self) -> QuizAttempt:
-        if not self.first_attempt_time:
-            self.first_attempt_time = time.time()
+        # Timer already started in __init__
         self.current_attempt = QuizAttempt(len(self.attempts) + 1)
         self.attempts.append(self.current_attempt)
         return self.current_attempt
@@ -72,6 +71,24 @@ class QuizRun:
     def can_retry(self, max_time: int = 150) -> bool:
         """Check if we can retry within time window"""
         return self.elapsed_time_since_first() < max_time
+    
+    def average_time_per_attempt(self) -> float:
+        """Calculate average time per attempt"""
+        if len(self.attempts) == 0:
+            return 0
+        return self.elapsed_time_since_first() / len(self.attempts)
+    
+    def can_retry_smart(self, max_time: int = 180) -> bool:
+        """Check if there's enough time for another attempt based on average time"""
+        if len(self.attempts) == 0:
+            return True  # Always allow first attempt
+        
+        elapsed = self.elapsed_time_since_first()
+        avg_time = self.average_time_per_attempt()
+        remaining_time = max_time - elapsed
+        
+        # Only retry if average time per attempt is less than remaining time
+        return avg_time < remaining_time
     
     def to_dict(self) -> Dict[str, Any]:
         return {

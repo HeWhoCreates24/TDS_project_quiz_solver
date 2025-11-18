@@ -470,6 +470,8 @@ class AnalysisTools:
                         col_stats["max"] = df[col].max()
                     elif stat == "count":
                         col_stats["count"] = df[col].count()
+                    elif stat == "sum":
+                        col_stats["sum"] = df[col].sum()
                     elif stat == "variance":
                         col_stats["variance"] = df[col].var()
                 results[col] = col_stats
@@ -718,6 +720,118 @@ class VisualizationTools:
 
 
 # ============================================================================
+# MULTIMEDIA TOOLS - Audio, Video, Image processing
+# ============================================================================
+
+class MultimediaTools:
+    """Tools for processing multimedia content"""
+    
+    @staticmethod
+    async def download_file(url: str, output_path: Optional[str] = None) -> str:
+        """Download file from URL"""
+        import os
+        import tempfile
+        from urllib.parse import urlparse
+        
+        try:
+            if not output_path:
+                parsed = urlparse(url)
+                ext = os.path.splitext(parsed.path)[1] or '.dat'
+                temp_dir = tempfile.gettempdir()
+                output_path = os.path.join(temp_dir, f"download_{abs(hash(url))}{ext}")
+            
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                
+                with open(output_path, 'wb') as f:
+                    f.write(response.content)
+            
+            logger.info(f"[DOWNLOAD] Downloaded {url} to {output_path} ({len(response.content)} bytes)")
+            return output_path
+        except Exception as e:
+            logger.error(f"[DOWNLOAD] Failed: {e}")
+            raise
+    
+    @staticmethod
+    def extract_audio_metadata(audio_path: str) -> Dict[str, Any]:
+        """Extract metadata from audio file"""
+        try:
+            import wave
+            import os
+            
+            metadata = {
+                "path": audio_path,
+                "size_bytes": os.path.getsize(audio_path),
+                "exists": os.path.exists(audio_path),
+                "filename": os.path.basename(audio_path)
+            }
+            
+            try:
+                with wave.open(audio_path, 'rb') as audio:
+                    metadata.update({
+                        "channels": audio.getnchannels(),
+                        "sample_width": audio.getsampwidth(),
+                        "framerate": audio.getframerate(),
+                        "frames": audio.getnframes(),
+                        "duration_seconds": audio.getnframes() / audio.getframerate()
+                    })
+            except:
+                pass
+            
+            return metadata
+        except Exception as e:
+            logger.error(f"[AUDIO_META] Failed: {e}")
+            return {"error": str(e), "path": audio_path}
+    
+    @staticmethod
+    async def transcribe_audio(audio_path: str, api_key: Optional[str] = None) -> Dict[str, Any]:
+        """Transcribe audio file to text using OpenAI Whisper API"""
+        try:
+            import os
+            
+            if not api_key:
+                api_key = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
+            
+            if not api_key:
+                return {"error": "No API key provided for transcription", "text": ""}
+            
+            # Use OpenRouter's Whisper endpoint or OpenAI directly
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                with open(audio_path, 'rb') as audio_file:
+                    files = {'file': audio_file}
+                    data = {'model': 'openai/whisper-1'}
+                    headers = {'Authorization': f'Bearer {api_key}'}
+                    
+                    # Try OpenAI Whisper API
+                    response = await client.post(
+                        'https://aipipe.org/openrouter/v1/audio/transcriptions',
+                        headers=headers,
+                        files=files,
+                        data=data
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        logger.info(f"[TRANSCRIBE] Success: {result.get('text', '')[:100]}...")
+                        return {
+                            "text": result.get('text', ''),
+                            "success": True,
+                            "audio_path": audio_path
+                        }
+                    else:
+                        logger.error(f"[TRANSCRIBE] Failed: {response.status_code} {response.text}")
+                        return {
+                            "error": f"API error: {response.status_code}",
+                            "text": "",
+                            "success": False
+                        }
+        except Exception as e:
+            logger.error(f"[TRANSCRIBE] Failed: {e}")
+            return {"error": str(e), "text": "", "success": False}
+
+
+# ============================================================================
 # Unified Tool Registry
 # ============================================================================
 
@@ -755,7 +869,12 @@ class ToolRegistry:
             "create_interactive_chart": VisualizationTools.create_interactive_chart,
             "generate_narrative": VisualizationTools.generate_narrative,
             "create_presentation_slide": VisualizationTools.create_presentation_slide,
-        }
+        },
+        "multimedia": {
+            "download_file": MultimediaTools.download_file,
+            "extract_audio_metadata": MultimediaTools.extract_audio_metadata,
+            "transcribe_audio": MultimediaTools.transcribe_audio,
+        },
     }
     
     @classmethod
