@@ -456,24 +456,33 @@ class AnalysisTools:
         try:
             results = {}
             for col in columns:
+                # Normalize column name (handle both string and int column names)
+                col_normalized = col
+                try:
+                    # Try converting to int for numeric column names
+                    col_normalized = int(col)
+                except (ValueError, TypeError):
+                    pass
+                
+                # Use normalized column name for all operations
                 col_stats = {}
                 for stat in stats:
                     if stat == "mean":
-                        col_stats["mean"] = df[col].mean()
+                        col_stats["mean"] = df[col_normalized].mean()
                     elif stat == "median":
-                        col_stats["median"] = df[col].median()
+                        col_stats["median"] = df[col_normalized].median()
                     elif stat == "std":
-                        col_stats["std"] = df[col].std()
+                        col_stats["std"] = df[col_normalized].std()
                     elif stat == "min":
-                        col_stats["min"] = df[col].min()
+                        col_stats["min"] = df[col_normalized].min()
                     elif stat == "max":
-                        col_stats["max"] = df[col].max()
+                        col_stats["max"] = df[col_normalized].max()
                     elif stat == "count":
-                        col_stats["count"] = df[col].count()
+                        col_stats["count"] = df[col_normalized].count()
                     elif stat == "sum":
-                        col_stats["sum"] = df[col].sum()
+                        col_stats["sum"] = df[col_normalized].sum()
                     elif stat == "variance":
-                        col_stats["variance"] = df[col].var()
+                        col_stats["variance"] = df[col_normalized].var()
                 results[col] = col_stats
             return results
         except Exception as e:

@@ -1,5 +1,6 @@
 """
-Tool execution functions and plan execution engine
+Main execution orchestration for quiz solving
+Handles plan execution, tool routing, and quiz pipeline
 """
 import os
 import time
@@ -7,1800 +8,26 @@ import json
 import logging
 import re
 import asyncio
-import base64
-import io
-import zipfile
-from typing import Any, Dict, List, Optional
-from tempfile import NamedTemporaryFile
+from typing import Any, Dict, List
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
-import httpx
-import pandas as pd
-import matplotlib.pyplot as plt
-from tools import ToolRegistry, ScrapingTools, CleansingTools, ProcessingTools, AnalysisTools, VisualizationTools
-from models import QuizAttempt, QuizRun
 
-# Load environment variables
+# Import from refactored modules
+from tool_executors import (
+    dataframe_registry, get_secret, extract_json_from_markdown,
+    render_page, fetch_text, download_file, parse_csv, parse_excel,
+    parse_json_file, parse_html_tables, parse_pdf_tables,
+    dataframe_ops, make_plot, zip_base64, answer_submit
+)
+from llm_client import call_llm, call_llm_with_tools, call_llm_for_plan
+from completion_checker import check_plan_completion, format_artifact
+from task_generator import generate_next_tasks
+from models import QuizAttempt, QuizRun
+from tools import ToolRegistry, ScrapingTools, CleansingTools, ProcessingTools, AnalysisTools, VisualizationTools
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Global registry for dataframes
-dataframe_registry = {}
-
-def get_secret():
-    """Get SECRET from environment, loaded via dotenv"""
-    return os.getenv("SECRET")
-
-
-def extract_json_from_markdown(text: str) -> str:
-    """Extract JSON from markdown code blocks"""
-    # Remove markdown code block markers
-    if "```json" in text:
-        start = text.find("```json") + 7
-        end = text.find("```", start)
-        if end != -1:
-            return text[start:end].strip()
-    elif "```" in text:
-        start = text.find("```") + 3
-        end = text.find("```", start)
-        if end != -1:
-            return text[start:end].strip()
-    return text
-
-
-async def render_page(url: str) -> Dict[str, Any]:
-    """Render page with Playwright and extract content"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        page = await browser.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        
-        # Wait for any dynamic content to render (up to 3 seconds)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=3000)
-        except:
-            pass
-        
-        content = await page.content()
-        text = await page.evaluate("() => document.body.innerText")
-        links = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-        pres = await page.eval_on_selector_all("pre,code", "els => els.map(e => e.innerText)")
-        
-        # Extract multimedia sources (audio, video, images)
-        audio_sources = await page.eval_on_selector_all("audio[src], audio source[src]", "els => els.map(e => e.src || e.getAttribute('src'))")
-        video_sources = await page.eval_on_selector_all("video[src], video source[src]", "els => els.map(e => e.src || e.getAttribute('src'))")
-        image_sources = await page.eval_on_selector_all("img[src]", "els => els.map(e => e.src)")
-        
-        # Try to extract any dynamically rendered content from divs with IDs
-        rendered_divs = await page.eval_on_selector_all("div[id]", "els => els.map(e => ({id: e.id, text: e.innerText, html: e.innerHTML}))")
-        
-        await browser.close()
-        return {
-            "html": content,
-            "text": text,
-            "links": links,
-            "code_blocks": pres,
-            "rendered_divs": rendered_divs,
-            "audio_sources": audio_sources,
-            "video_sources": video_sources,
-            "image_sources": image_sources
-        }
-
-async def fetch_text(url: str) -> Dict[str, Any]:
-    """Fetch text content from URL"""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=30)
-            response.raise_for_status()
-            return {
-                "text": response.text,
-                "headers": dict(response.headers),
-                "status_code": response.status_code
-            }
-    except Exception as e:
-        logger.error(f"Error fetching text from {url}: {e}")
-        raise
-
-async def download_file(url: str) -> Dict[str, Any]:
-    """Download file and return metadata"""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=60)
-            response.raise_for_status()
-            
-            # Preserve original file extension
-            import os
-            filename = url.split("/")[-1].split("?")[0]  # Remove query params
-            _, ext = os.path.splitext(filename)
-            suffix = ext if ext else ".download"
-            
-            with NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                tmp_file.write(response.content)
-                tmp_path = tmp_file.name
-            
-            return {
-                "path": tmp_path,
-                "content_type": response.headers.get("content-type", "unknown"),
-                "size": len(response.content),
-                "filename": filename
-            }
-    except Exception as e:
-        logger.error(f"Error downloading file from {url}: {e}")
-        raise
-
-def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
-    """Parse CSV file from path or URL"""
-    try:
-        # If URL is provided, use it directly
-        source = url if url else path
-        if not source:
-            raise ValueError("Either 'path' or 'url' must be provided")
-        
-        # Try reading first to detect if it has headers
-        # Read a sample to check if first row looks like data or headers
-        sample_df = pd.read_csv(source, nrows=5)
-        
-        # Heuristic: If the first row (column names) are all numeric, likely no header
-        has_header = True
-        try:
-            # If all column names can be converted to numbers, it's likely data not headers
-            all_numeric = all(str(col).replace('.', '').replace('-', '').isdigit() for col in sample_df.columns)
-            if all_numeric:
-                has_header = False
-                logger.info(f"[PARSE_CSV] Detected no header - first row appears to be numeric data")
-        except:
-            pass
-        
-        # Read the full CSV with appropriate header setting
-        if has_header:
-            df = pd.read_csv(source)
-        else:
-            df = pd.read_csv(source, header=None)
-            # Give default column names like 'column_0', 'column_1', etc.
-            df.columns = [f'column_{i}' for i in range(len(df.columns))]
-        
-        dataframe_registry[f"df_{len(dataframe_registry)}"] = df
-        return {
-            "dataframe_key": f"df_{len(dataframe_registry)-1}",
-            "shape": df.shape,
-            "columns": list(df.columns),
-            "sample": df.head().to_dict()
-        }
-    except Exception as e:
-        logger.error(f"Error parsing CSV from {source}: {e}")
-        raise
-
-def parse_excel(path: str) -> Dict[str, Any]:
-    """Parse Excel file"""
-    try:
-        df = pd.read_excel(path)
-        dataframe_registry[f"df_{len(dataframe_registry)}"] = df
-        return {
-            "dataframe_key": f"df_{len(dataframe_registry)-1}",
-            "shape": df.shape,
-            "columns": list(df.columns),
-            "sample": df.head().to_dict()
-        }
-    except Exception as e:
-        logger.error(f"Error parsing Excel {path}: {e}")
-        raise
-
-def parse_json_file(path: str) -> Dict[str, Any]:
-    """Parse JSON file"""
-    try:
-        with open(path, 'r') as f:
-            data = json.load(f)
-        return {"data": data, "type": type(data).__name__}
-    except Exception as e:
-        logger.error(f"Error parsing JSON {path}: {e}")
-        raise
-
-def parse_html_tables(html_content: str) -> Dict[str, Any]:
-    """Parse HTML tables"""
-    try:
-        tables = pd.read_html(html_content)
-        result = {}
-        for i, table in enumerate(tables):
-            key = f"table_{i}"
-            dataframe_registry[key] = table
-            result[key] = {
-                "shape": table.shape,
-                "columns": list(table.columns),
-                "sample": table.head().to_dict()
-            }
-        return {"tables": result}
-    except Exception as e:
-        logger.error(f"Error parsing HTML tables: {e}")
-        raise
-
-def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
-    """Parse PDF tables (placeholder)"""
-    try:
-        return {
-            "warning": "PDF parsing requires pdfplumber installation",
-            "path": path,
-            "pages": pages
-        }
-    except Exception as e:
-        logger.error(f"Error parsing PDF {path}: {e}")
-        raise
-
-def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Perform DataFrame operations"""
-    df_key = params.get("dataframe_key")
-    if df_key not in dataframe_registry:
-        raise ValueError(f"DataFrame {df_key} not found in registry")
-    
-    df = dataframe_registry[df_key]
-    result = None
-    
-    if op == "select":
-        columns = params.get("columns", [])
-        result = df[columns] if columns else df
-    elif op == "filter":
-        condition = params.get("condition")
-        if condition:
-            # Parse condition to add backticks around column names if needed
-            import re
-            # Find column names (words before operators)
-            parts = re.split(r'(\s*[<>=!]+\s*)', condition)
-            if len(parts) >= 1:
-                col_name = parts[0].strip()
-                # Check if column name is numeric or needs backticks
-                if col_name.isdigit() or not col_name.isidentifier():
-                    condition = f"`{col_name}`" + ''.join(parts[1:])
-            
-            logger.info(f"[FILTER] Original condition: {params.get('condition')}, Modified: {condition}")
-            logger.info(f"[FILTER] DataFrame shape before: {df.shape}, columns: {df.columns.tolist()}")
-            
-            # Try query first
-            try:
-                result = df.query(condition)
-                logger.info(f"[FILTER] Query succeeded. Shape after: {result.shape}")
-            except Exception as e:
-                logger.warning(f"[FILTER] Query failed with error: {e}")
-                # Fallback to boolean indexing
-                try:
-                    # Last resort: use boolean indexing
-                    logger.warning(f"[FILTER] query() failed, using boolean indexing for: {condition}")
-                    # Parse simple conditions like "column >= value"
-                    match = re.match(r'([^\s<>=!]+)\s*([<>=!]+)\s*(.+)', condition)
-                    if match:
-                        col, op_str, val = match.groups()
-                        col = col.strip()
-                        val = val.strip()
-                        
-                        # Convert value to appropriate type
-                        try:
-                            val = float(val) if '.' in val else int(val)
-                        except:
-                            pass
-                        
-                        # Apply boolean indexing
-                        if op_str == '>=':
-                            result = df[df[col] >= val]
-                        elif op_str == '>':
-                            result = df[df[col] > val]
-                        elif op_str == '<=':
-                            result = df[df[col] <= val]
-                        elif op_str == '<':
-                            result = df[df[col] < val]
-                        elif op_str == '==':
-                            result = df[df[col] == val]
-                        elif op_str == '!=':
-                            result = df[df[col] != val]
-                        else:
-                            raise ValueError(f"Unknown operator: {op_str}")
-                    else:
-                        raise ValueError(f"Could not parse filter condition: {condition}")
-                except Exception:
-                    # If fallback parsing/indexing fails, let the original exception propagate
-                    raise
-        else:
-            result = df
-    elif op == "sum":
-        column = params.get("column")
-        result = df[column].sum() if column else df.sum()
-    elif op == "mean":
-        column = params.get("column")
-        result = df[column].mean() if column else df.mean()
-    elif op == "groupby":
-        by = params.get("by")
-        agg = params.get("aggregation", "count")
-        result = df.groupby(by).agg(agg)
-    elif op == "count":
-        result = len(df)
-    else:
-        raise ValueError(f"Unknown operation: {op}")
-    
-    if isinstance(result, pd.DataFrame):
-        new_key = f"df_{len(dataframe_registry)}"
-        dataframe_registry[new_key] = result
-        return {
-            "dataframe_key": new_key,
-            "result": "DataFrame operation completed",
-            "shape": result.shape
-        }
-    else:
-        return {"result": result, "type": type(result).__name__}
-
-def make_plot(spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Create plot and return base64 data URI"""
-    try:
-        plt.figure(figsize=spec.get("figsize", (10, 6)))
-        
-        plot_type = spec.get("type", "line")
-        data_key = spec.get("dataframe_key")
-        
-        if data_key in dataframe_registry:
-            df = dataframe_registry[data_key]
-            x = spec.get("x")
-            y = spec.get("y")
-            
-            if plot_type == "line":
-                plt.plot(df[x] if x else df.index, df[y] if y else df.values)
-            elif plot_type == "bar":
-                plt.bar(df[x] if x else df.index, df[y] if y else df.values)
-            elif plot_type == "scatter":
-                plt.scatter(df[x], df[y])
-            elif plot_type == "histogram":
-                plt.hist(df[y] if y else df.values.flatten())
-        else:
-            data = spec.get("data", [])
-            plt.plot(data)
-        
-        plt.title(spec.get("title", "Plot"))
-        plt.xlabel(spec.get("xlabel", ""))
-        plt.ylabel(spec.get("ylabel", ""))
-        
-        if spec.get("grid"):
-            plt.grid(True)
-        
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-        plt.close()
-        buf.seek(0)
-        img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        
-        return {"base64_uri": f"data:image/png;base64,{img_base64}"}
-        
-    except Exception as e:
-        logger.error(f"Error creating plot: {e}")
-        raise
-
-def zip_base64(paths: List[str]) -> Dict[str, Any]:
-    """Zip files and return base64 data URI"""
-    try:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w') as zip_file:
-            for path in paths:
-                zip_file.write(path, os.path.basename(path))
-        
-        buf.seek(0)
-        zip_base64_str = base64.b64encode(buf.read()).decode('utf-8')
-        
-        return {"base64_uri": f"data:application/zip;base64,{zip_base64_str}"}
-        
-    except Exception as e:
-        logger.error(f"Error creating zip: {e}")
-        raise
-
-async def answer_submit(url: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Submit answer to quiz endpoint"""
-    try:
-        logger.info(f"[API_REQUEST] POST {url}")
-        logger.info(f"[API_REQUEST_BODY] {json.dumps(body, indent=2)[:500]}...")
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=body, timeout=30)
-            response.raise_for_status()
-            
-            response_data = response.json() if response.content else {}
-            logger.info(f"[API_RESPONSE] Status: {response.status_code}")
-            logger.info(f"[API_RESPONSE_BODY] {json.dumps(response_data, indent=2)[:500]}...")
-            
-            return {
-                "status_code": response.status_code,
-                "response": response_data,
-                "headers": dict(response.headers)
-            }
-    except Exception as e:
-        logger.error(f"[API_ERROR] Error submitting answer to {url}: {e}")
-        if 'response' in locals():
-            logger.error(f"[API_ERROR_RESPONSE] {response.text[:500]}")
-        logger.error(f"[API_ERROR_BODY] {json.dumps(body, indent=2)[:500]}")
-        print(f"Submission body: {body}")
-        raise
-
-model = "openai/gpt-5-nano"
-
-async def call_llm(prompt: str, system_prompt: str = None, max_tokens: int = 2000, temperature: float = 0) -> str:
-    """Call LLM with given prompt"""
-    if system_prompt is None:
-        system_prompt = "You are a helpful assistant."
-    
-    OPEN_AI_BASE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
-    API_KEY = os.getenv("API_KEY")
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    json_data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    
-    logger.info(f"[LLM_CALL] System prompt: {system_prompt[:100]}...")
-    logger.info(f"[LLM_CALL] User prompt: {prompt[:200]}...")
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        answer_text = data["choices"][0]["message"]["content"]
-        logger.info(f"[LLM_RESPONSE] Content: {answer_text[:300]}...")
-        return answer_text.strip()
-
-def get_tool_definitions() -> List[Dict[str, Any]]:
-    """Define available tools for OpenAI function calling"""
-    return [
-        # SCRAPING TOOLS
-        {
-            "type": "function",
-            "function": {
-                "name": "render_js_page",
-                "description": "Render a webpage with JavaScript execution and extract content including text, links, code blocks, and rendered div elements",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL of the page to render"
-                        }
-                    },
-                    "required": ["url"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "fetch_text",
-                "description": "Fetch text content from a URL via HTTP GET request",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to fetch content from"
-                        }
-                    },
-                    "required": ["url"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "fetch_from_api",
-                "description": "Fetch data from API with custom headers and body (supports GET, POST, PUT, DELETE)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "API endpoint URL"
-                        },
-                        "method": {
-                            "type": "string",
-                            "enum": ["GET", "POST", "PUT", "DELETE"],
-                            "description": "HTTP method (default: GET)"
-                        },
-                        "headers": {
-                            "type": "object",
-                            "description": "Custom headers as key-value pairs",
-                            "additionalProperties": {"type": "string"}
-                        },
-                        "body": {
-                            "type": "object",
-                            "description": "Request body for POST/PUT as JSON object",
-                            "additionalProperties": True
-                        }
-                    },
-                    "required": ["url"]
-                }
-            }
-        },
-        # DATA PARSING TOOLS
-        {
-            "type": "function",
-            "function": {
-                "name": "parse_csv",
-                "description": "Parse a CSV file from a local path or URL and load it into a pandas DataFrame",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "URL to the CSV file"
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Local file path to the CSV file"
-                        }
-                    }
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "parse_excel",
-                "description": "Parse Excel file (.xlsx, .xls) into a DataFrame",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to Excel file"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "parse_json_file",
-                "description": "Parse JSON file into structured data",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to JSON file"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "parse_html_tables",
-                "description": "Extract tables from HTML content",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path_or_html": {
-                            "type": "string",
-                            "description": "HTML file path or raw HTML string"
-                        }
-                    },
-                    "required": ["path_or_html"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "parse_pdf_tables",
-                "description": "Extract tables from PDF files",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to PDF file"
-                        },
-                        "pages": {
-                            "type": "string",
-                            "description": "Pages to extract (e.g., 'all', '1-3', '1,4,6')"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        },
-        # DATA CLEANSING TOOLS
-        {
-            "type": "function",
-            "function": {
-                "name": "clean_text",
-                "description": "Clean and normalize text data (remove whitespace, special chars, normalize case)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Text to clean"
-                        },
-                        "remove_special_chars": {
-                            "type": "boolean",
-                            "description": "Remove special characters"
-                        },
-                        "normalize_whitespace": {
-                            "type": "boolean",
-                            "description": "Normalize whitespace"
-                        }
-                    },
-                    "required": ["text"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "extract_patterns",
-                "description": "Extract patterns from text using regex (emails, URLs, phone numbers, etc.)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Text to extract from"
-                        },
-                        "pattern_type": {
-                            "type": "string",
-                            "enum": ["email", "url", "phone", "date", "number", "custom"],
-                            "description": "Type of pattern to extract"
-                        },
-                        "custom_pattern": {
-                            "type": "string",
-                            "description": "Custom regex pattern if pattern_type is 'custom'"
-                        }
-                    },
-                    "required": ["text", "pattern_type"]
-                }
-            }
-        },
-        # DATA PROCESSING TOOLS
-        {
-            "type": "function",
-            "function": {
-                "name": "transform_data",
-                "description": "Transform data using various operations (reshape, pivot, melt, transpose)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry (e.g., 'df_0')"
-                        },
-                        "operation": {
-                            "type": "string",
-                            "enum": ["pivot", "melt", "transpose", "reshape"],
-                            "description": "Transformation operation"
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Operation-specific parameters",
-                            "properties": {
-                                "index": {
-                                    "type": "string",
-                                    "description": "For pivot: column to use as index"
-                                },
-                                "columns": {
-                                    "type": "string",
-                                    "description": "For pivot: column to use as columns"
-                                },
-                                "values": {
-                                    "type": "string",
-                                    "description": "For pivot: column to use as values"
-                                }
-                            }
-                        }
-                    },
-                    "required": ["dataframe", "operation"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "transcribe_audio",
-                "description": "Transcribe audio file to text using speech recognition",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "audio_path": {
-                            "type": "string",
-                            "description": "Path to audio file"
-                        }
-                    },
-                    "required": ["audio_path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "analyze_image",
-                "description": "Analyze image content using vision AI",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "image_path": {
-                            "type": "string",
-                            "description": "Path to image file"
-                        },
-                        "task": {
-                            "type": "string",
-                            "enum": ["describe", "ocr", "detect_objects", "classify"],
-                            "description": "Analysis task to perform"
-                        }
-                    },
-                    "required": ["image_path", "task"]
-                }
-            }
-        },
-        # DATA ANALYSIS TOOLS
-        {
-            "type": "function",
-            "function": {
-                "name": "dataframe_ops",
-                "description": "Perform operations on DataFrames: filter rows, calculate sums/means, select columns, etc.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "op": {
-                            "type": "string",
-                            "description": "Operation type",
-                            "enum": ["filter", "sum", "mean", "count", "select", "groupby"]
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Operation parameters",
-                            "properties": {
-                                "dataframe_key": {
-                                    "type": "string",
-                                    "description": "DataFrame to operate on (e.g., 'df_0')"
-                                },
-                                "condition": {
-                                    "type": "string",
-                                    "description": "For filter: COMPLETE condition string with column name, operator, and value (e.g., '96903 >= 1371' or 'temperature > 25'). MUST include the full comparison value."
-                                },
-                                "column": {
-                                    "type": "string",
-                                    "description": "For sum/mean: column name to aggregate"
-                                }
-                            },
-                            "required": ["dataframe_key"]
-                        }
-                    },
-                    "required": ["op", "params"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "calculate_statistics",
-                "description": "Calculate statistical measures (mean, median, std, percentiles, sum, etc.) from a dataframe",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry (e.g., 'df_0')"
-                        },
-                        "columns": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Columns to analyze (optional, defaults to all numeric columns)"
-                        },
-                        "stats": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "enum": ["mean", "median", "std", "min", "max", "count", "sum"],
-                            "description": "Statistics to calculate (e.g., ['sum'], ['mean', 'std'])"
-                        }
-                    },
-                    "required": ["dataframe", "stats"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "apply_ml_model",
-                "description": "Apply machine learning models (regression, classification, clustering)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry (e.g., 'df_0')"
-                        },
-                        "model_type": {
-                            "type": "string",
-                            "enum": ["linear_regression", "logistic_regression", "kmeans", "decision_tree"],
-                            "description": "ML model to apply"
-                        },
-                        "kwargs": {
-                            "type": "object",
-                            "description": "Model parameters",
-                            "properties": {
-                                "target_column": {
-                                    "type": "string",
-                                    "description": "Target/y column for supervised learning"
-                                },
-                                "feature_columns": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Feature/X columns"
-                                },
-                                "n_clusters": {
-                                    "type": "integer",
-                                    "description": "Number of clusters for kmeans"
-                                }
-                            }
-                        }
-                    },
-                    "required": ["dataframe", "model_type"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "geospatial_analysis",
-                "description": "Perform geospatial analysis (distance calculation, geocoding, spatial joins)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key with geospatial data (e.g., 'df_0')"
-                        },
-                        "analysis_type": {
-                            "type": "string",
-                            "enum": ["distance", "geocode", "spatial_join", "buffer"],
-                            "description": "Type of geospatial analysis"
-                        },
-                        "kwargs": {
-                            "type": "object",
-                            "description": "Analysis parameters",
-                            "properties": {
-                                "lat_col": {
-                                    "type": "string",
-                                    "description": "Latitude column name"
-                                },
-                                "lon_col": {
-                                    "type": "string",
-                                    "description": "Longitude column name"
-                                },
-                                "address_col": {
-                                    "type": "string",
-                                    "description": "Address column for geocoding"
-                                }
-                            }
-                        }
-                    },
-                    "required": ["analysis_type"]
-                }
-            }
-        },
-        # VISUALIZATION TOOLS
-        {
-            "type": "function",
-            "function": {
-                "name": "create_chart",
-                "description": "Create static charts (bar, line, scatter, pie, histogram, etc.)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry"
-                        },
-                        "chart_type": {
-                            "type": "string",
-                            "enum": ["bar", "line", "scatter", "pie", "histogram", "box"],
-                            "description": "Type of chart to create"
-                        },
-                        "x_col": {
-                            "type": "string",
-                            "description": "X-axis column name"
-                        },
-                        "y_col": {
-                            "type": "string",
-                            "description": "Y-axis column name"
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "Chart title"
-                        },
-                        "output_path": {
-                            "type": "string",
-                            "description": "Path to save chart image"
-                        }
-                    },
-                    "required": ["dataframe", "chart_type"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "create_interactive_chart",
-                "description": "Create interactive charts using Plotly (supports zoom, hover, etc.)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry"
-                        },
-                        "chart_type": {
-                            "type": "string",
-                            "enum": ["bar", "line", "scatter", "pie", "3d_scatter"],
-                            "description": "Type of interactive chart"
-                        },
-                        "x_col": {
-                            "type": "string",
-                            "description": "X-axis column"
-                        },
-                        "y_col": {
-                            "type": "string",
-                            "description": "Y-axis column"
-                        },
-                        "title": {
-                            "type": "string",
-                            "description": "Chart title"
-                        }
-                    },
-                    "required": ["dataframe", "chart_type"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "generate_narrative",
-                "description": "Generate natural language narrative from data analysis results",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry (e.g., 'df_0')"
-                        },
-                        "summary_stats": {
-                            "type": "object",
-                            "description": "Summary statistics to include",
-                            "properties": {
-                                "mean": {"type": "number"},
-                                "median": {"type": "number"},
-                                "std": {"type": "number"},
-                                "count": {"type": "integer"}
-                            },
-                            "additionalProperties": True
-                        }
-                    },
-                    "required": ["dataframe"]
-                }
-            }
-        },
-        # UTILITY TOOLS
-        {
-            "type": "function",
-            "function": {
-                "name": "call_llm",
-                "description": "Call an LLM to analyze data, extract information, or generate content",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "prompt": {
-                            "type": "string",
-                            "description": "The prompt to send to the LLM"
-                        },
-                        "system_prompt": {
-                            "type": "string",
-                            "description": "Optional system prompt to guide the LLM's behavior"
-                        },
-                        "max_tokens": {
-                            "type": "integer",
-                            "description": "Maximum tokens in the response"
-                        },
-                        "temperature": {
-                            "type": "number",
-                            "description": "Temperature for response generation (0.0 to 2.0)"
-                        }
-                    },
-                    "required": ["prompt"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "download_file",
-                "description": "Download a binary file from a URL (images, audio, video, documents, etc.)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL of the file to download"
-                        }
-                    },
-                    "required": ["url"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "extract_audio_metadata",
-                "description": "Extract metadata from audio file (duration, sample rate, channels, etc.)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to downloaded audio file"
-                        }
-                    },
-                    "required": ["path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "transcribe_audio",
-                "description": "Transcribe audio file to text using speech-to-text. Use this to extract instructions or information from audio files.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "audio_path": {
-                            "type": "string",
-                            "description": "Path to the audio file to transcribe"
-                        }
-                    },
-                    "required": ["audio_path"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "make_plot",
-                "description": "Create custom plots with detailed specifications",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "spec": {
-                            "type": "object",
-                            "description": "Plot specification",
-                            "properties": {
-                                "type": {
-                                    "type": "string",
-                                    "description": "Plot type (line, bar, scatter, etc.)"
-                                },
-                                "data": {
-                                    "type": "object",
-                                    "description": "Data source",
-                                    "properties": {
-                                        "dataframe_key": {"type": "string"},
-                                        "x": {"type": "string", "description": "X column"},
-                                        "y": {"type": "string", "description": "Y column"}
-                                    }
-                                },
-                                "title": {"type": "string"},
-                                "output_path": {"type": "string"}
-                            },
-                            "required": ["type", "data"]
-                        }
-                    },
-                    "required": ["spec"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "zip_base64",
-                "description": "Create a zip archive and encode as base64",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "paths": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "File paths to include in zip"
-                        }
-                    },
-                    "required": ["paths"]
-                }
-            }
-        }
-    ]
-
-async def call_llm_with_tools(page_data: Dict[str, Any], previous_attempts: List["QuizAttempt"] = None) -> Dict[str, Any]:
-    """
-    Generate execution plan using OpenAI function/tool calling API.
-    This is more robust than prompt-based JSON generation.
-    """
-    # Build context from previous attempts
-    previous_context = ""
-    if previous_attempts and len(previous_attempts) > 0:
-        previous_context = "\n\nPREVIOUS ATTEMPTS (what didn't work):\n"
-        for prev in previous_attempts:
-            previous_context += f"\nAttempt {prev.attempt_number}:\n"
-            previous_context += f"  - Answer submitted: {str(prev.answer)[:100]}\n"
-            previous_context += f"  - Was correct: {prev.correct}\n"
-            if prev.error:
-                previous_context += f"  - Error: {prev.error}\n"
-            if prev.submission_response:
-                reason = prev.submission_response.get('reason', 'N/A')
-                previous_context += f"  - Reason for failure: {reason}\n"
-        previous_context += "\nUSE THIS INFORMATION TO GENERATE A BETTER PLAN!\n"
-    
-    system_prompt = """You are an execution planner for an automated quiz-solving agent.
-Analyze the quiz page and USE FUNCTION CALLING to indicate which tools to use.
-
-CRITICAL RULES:
-1. ONLY call tools to GET information needed for the answer
-2. DO NOT call tools to submit the answer (we handle submission separately)
-3. If the answer is already in the page or is obvious, respond directly WITHOUT calling tools
-4. For data analysis tasks, call MULTIPLE tools in sequence (e.g., parse_csv → calculate_statistics)
-
-Common patterns:
-- Page says "answer anything" or "any value" → NO TOOLS, respond with a simple answer like "anything you want"
-- Page has links to visit/scrape → CALL render_js_page(url) to get content from those pages
-- Page references CSV/data and asks for sum/stats → CALL parse_csv(url) AND calculate_statistics or dataframe_ops
-- Page has complex text → CALL call_llm(prompt) to extract information
-
-NEVER call fetch_from_api or any tool to POST to /submit - we handle submissions automatically.
-
-DATA ANALYSIS EXAMPLES:
-✅ "Sum numbers in data.csv" → CALL parse_csv, THEN calculate_statistics with stats=["sum"]
-✅ "Filter values > 1000" → CALL parse_csv, THEN dataframe_ops with op="filter"
-✅ "Count rows where X > Y" → CALL parse_csv, THEN dataframe_ops with op="filter", THEN count
-
-SCRAPING EXAMPLES:
-✅ Page: "Visit https://example.com/secret" → CALL render_js_page({"url": "https://example.com/secret"})
-✅ Page: "The answer can be anything" → NO TOOLS, respond: "Hello World"
-❌ WRONG: Calling fetch_from_api to POST to /submit (we do this for you)"""
-
-    # Check if page references data files and multimedia
-    page_text_lower = page_data['text'].lower()
-    has_csv_link = any('.csv' in str(link).lower() for link in page_data.get('links', []))
-    has_audio = len(page_data.get('audio_sources', [])) > 0
-    has_video = len(page_data.get('video_sources', [])) > 0
-    has_images = len(page_data.get('image_sources', [])) > 0
-    
-    data_hint = ""
-    tool_choice_mode = "auto"
-    
-    # Check for multimedia first - audio often contains instructions
-    if has_audio:
-        audio_url = page_data['audio_sources'][0]
-        logger.info(f"[AUDIO_DETECTED] Page has audio source: {audio_url}")
-        logger.info(f"[PAGE_TEXT] Full text: {page_data['text']}")
-        logger.info(f"[MULTIMEDIA] Audio sources: {page_data.get('audio_sources', [])}")
-        
-        tool_choice_mode = "required"
-        
-        csv_link = None
-        if has_csv_link:
-            csv_link = next((link for link in page_data['links'] if '.csv' in str(link).lower()), None)
-        
-        data_hint = f"""
-
-🚨 CRITICAL INSTRUCTION - AUDIO + DATA ANALYSIS TASK 🚨
-
-The page contains an AUDIO file: {audio_url}
-{f'The page also contains a CSV file: {csv_link}' if csv_link else ''}
-
-⚠️ THE AUDIO FILE CONTAINS SPOKEN INSTRUCTIONS FOR WHAT TO DO WITH THE DATA ⚠️
-
-You MUST call ALL of these tools in your SINGLE response (we will execute them in sequence):
-
-1. download_file
-   Arguments: {{"url": "{audio_url}"}}
-   This downloads the audio file and returns {{"path": "...", ...}}
-
-2. transcribe_audio
-   Arguments: {{"audio_path": "${{download_file_result_1.path}}"}}
-   Use the path from step 1 to transcribe the audio to text
-
-{f'''3. parse_csv
-   Arguments: {{"url": "{csv_link}"}}
-   Load the CSV data into a dataframe
-
-4. Based on what the transcribed audio says, call the appropriate analysis tool:
-   - If audio says "sum": calculate_statistics with {{"dataframe": "df_0", "stats": ["sum"]}}
-   - If audio says "mean/average": calculate_statistics with {{"dataframe": "df_0", "stats": ["mean"]}}
-   - If audio says "count": calculate_statistics with {{"dataframe": "df_0", "stats": ["count"]}}
-   - If audio says "max/maximum": calculate_statistics with {{"dataframe": "df_0", "stats": ["max"]}}
-   - If audio says "min/minimum": calculate_statistics with {{"dataframe": "df_0", "stats": ["min"]}}
-''' if csv_link else ''}
-
-IMPORTANT: Call ALL required tools in ONE response. Don't call just download_file - call download_file AND transcribe_audio{' AND parse_csv AND the analysis tool' if csv_link else ''}.
-The answer is NOT the file metadata - it's the result from analyzing the data based on audio instructions.
-"""
-    elif has_csv_link:
-        csv_link = next((link for link in page_data['links'] if '.csv' in str(link).lower()), None)
-        logger.info(f"[CSV_DETECTED] Page has CSV link: {csv_link}")
-        logger.info(f"[PAGE_TEXT] Full text: {page_data['text']}")
-        
-        # Only force CSV analysis if page explicitly asks for it
-        analysis_keywords = ['sum', 'total', 'count', 'average', 'mean', 'filter', 'calculate', 'add up', 'compute']
-        needs_analysis = any(kw in page_text_lower for kw in analysis_keywords)
-        
-        if needs_analysis:
-            tool_choice_mode = "required"
-            data_hint = f"""
-
-🚨 CSV DATA ANALYSIS TASK 🚨
-
-The page contains a CSV file: {csv_link}
-Call parse_csv to load it, then perform the requested analysis.
-"""
-    
-    prompt = f"""
-QUIZ PAGE DATA:
-Text: {page_data['text']}
-Code blocks: {page_data['code_blocks']}
-Links: {page_data['links']}
-HTML preview: {page_data['html'][:500]}...{previous_context}{data_hint}
-
-TASK: Determine ALL tools needed to GET the complete answer.
-
-IMPORTANT: If the quiz requires data analysis (sum, filter, count, etc.), you must call:
-1. First tool to load data (parse_csv, parse_excel, etc.)
-2. Second tool to analyze data (calculate_statistics, dataframe_ops, etc.)
-
-DECISION TREE:
-1. Does the page say the answer can be "anything" or "any value"? → NO TOOLS, just respond with any string
-2. Does the page ask to analyze/sum/filter data AND there's a CSV/data file? → CALL parse_csv + calculate_statistics
-3. Does the page have links you need to visit (HTML pages)? → CALL render_js_page for each link
-4. Is the answer obvious from the page text? → NO TOOLS, respond with the answer
-
-Remember: Call ALL tools needed in ONE response. We can execute multiple tools in sequence.
-"""
-
-    OPEN_AI_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
-    API_KEY = os.getenv("API_KEY")
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    
-    # Get tool definitions
-    tools = get_tool_definitions()
-    
-    json_data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "tools": tools,
-        "tool_choice": tool_choice_mode,  # Force tools when CSV detected
-        "temperature": 0,
-        "max_tokens": 3000,
-    }
-    
-    if tool_choice_mode == "required":
-        logger.info(f"[LLM_TOOLS] Forcing tool usage (tool_choice=required) due to CSV detection")
-    
-    async with httpx.AsyncClient() as client:
-        response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        
-        message = data["choices"][0]["message"]
-        
-        # Check if model wants to call tools
-        if message.get("tool_calls"):
-            logger.info(f"[LLM_TOOLS] Model requested {len(message['tool_calls'])} tool call(s)")
-            
-            # Convert tool calls to our task format
-            tasks = []
-            for i, tool_call in enumerate(message["tool_calls"]):
-                func_name = tool_call["function"]["name"]
-                args_str = tool_call["function"]["arguments"]
-                
-                # Try to parse arguments with error handling for malformed JSON
-                try:
-                    func_args = json.loads(args_str)
-                except json.JSONDecodeError as e:
-                    logger.error(f"[LLM_TOOL_{i+1}] Malformed JSON arguments for {func_name}: {e}")
-                    logger.error(f"[LLM_TOOL_{i+1}] Raw arguments (first 500 chars): {args_str[:500]}")
-                    
-                    # Try aggressive cleaning and URL extraction
-                    try:
-                        # Strategy 1: Extract URL from garbage and reconstruct minimal valid JSON
-                        url_match = re.search(r'https?://[^\s\'"}<]+', args_str)
-                        if url_match and func_name == "parse_csv":
-                            extracted_url = url_match.group(0)
-                            # Remove any trailing garbage from URL
-                            extracted_url = re.sub(r'[\'"}]+.*$', '', extracted_url)
-                            func_args = {"url": extracted_url, "path": ""}
-                            logger.info(f"[LLM_TOOL_{i+1}] Extracted URL from garbage: {extracted_url}")
-                        else:
-                            # Strategy 2: Try standard JSON cleaning
-                            # Remove trailing commas before closing braces/brackets
-                            cleaned = re.sub(r',\s*}', '}', args_str)
-                            cleaned = re.sub(r',\s*]', ']', cleaned)
-                            # Remove control characters and non-ASCII garbage
-                            cleaned = re.sub(r'[\x00-\x1f\x7f-\x9f\u0080-\uffff]', '', cleaned)
-                            # Extract just the JSON object if there's garbage after
-                            json_match = re.search(r'\{[^}]*\}', cleaned)
-                            if json_match:
-                                cleaned = json_match.group(0)
-                            func_args = json.loads(cleaned)
-                            logger.info(f"[LLM_TOOL_{i+1}] Successfully cleaned malformed JSON")
-                    except Exception as repair_error:
-                        # If still fails, skip this tool call
-                        logger.error(f"[LLM_TOOL_{i+1}] Could not repair JSON: {repair_error}")
-                        logger.error(f"[LLM_TOOL_{i+1}] Skipping tool call {func_name}")
-                        continue
-                
-                # Clean URL arguments - remove trailing punctuation
-                if "url" in func_args and isinstance(func_args["url"], str):
-                    func_args["url"] = func_args["url"].rstrip('.,;:"\' ')
-                
-                logger.info(f"[LLM_TOOL_{i+1}] {func_name} with args: {func_args}")
-                
-                tasks.append({
-                    "id": f"task_{i+1}",
-                    "tool_name": func_name,
-                    "inputs": func_args,
-                    "produces": [{"key": f"{func_name}_result_{i+1}", "type": "json"}],
-                    "notes": f"Generated via function calling: {func_name}"
-                })
-            
-            return {
-                "tasks": tasks,
-                "tool_calls": message["tool_calls"],
-                "content": message.get("content"),
-                "finish_reason": data["choices"][0]["finish_reason"]
-            }
-        else:
-            # Model responded directly without tool calls
-            logger.info(f"[LLM_DIRECT] Model responded without tool calls")
-            return {
-                "tasks": [],
-                "tool_calls": None,
-                "content": message.get("content"),
-                "finish_reason": data["choices"][0]["finish_reason"]
-            }
-
-async def call_llm_for_plan(page_data: Dict[str, Any], previous_attempts: List["QuizAttempt"] = None) -> str:
-    """Generate execution plan using LLM with correct schema and previous attempt context"""
-    
-    # Build context from previous attempts
-    previous_context = ""
-    if previous_attempts and len(previous_attempts) > 0:
-        previous_context = "\n\nPREVIOUS ATTEMPTS (what didn't work):\n"
-        for prev in previous_attempts:
-            previous_context += f"\nAttempt {prev.attempt_number}:\n"
-            previous_context += f"  - Answer submitted: {str(prev.answer)[:100]}\n"
-            previous_context += f"  - Was correct: {prev.correct}\n"
-            if prev.error:
-                previous_context += f"  - Error: {prev.error}\n"
-            if prev.submission_response:
-                reason = prev.submission_response.get('reason', 'N/A')
-                previous_context += f"  - Reason for failure: {reason}\n"
-        previous_context += "\nUSE THIS INFORMATION TO GENERATE A BETTER PLAN FOR THIS ATTEMPT!\n"
-    
-    system_prompt = """
-You are an execution planner for an automated quiz-solving agent. Your job is to analyze a rendered quiz page and generate a machine-executable JSON plan.
-
-OUTPUT FORMAT - YOU MUST OUTPUT VALID JSON ONLY:
-{
-  "submit_url": "string - the URL to POST the answer to",
-  "origin_url": "string - the original quiz page URL",
-  "tasks": [
-    {
-      "id": "task_1",
-      "tool_name": "tool_name_here",
-      "inputs": {},
-      "produces": [{"key": "output_key", "type": "string"}],
-      "notes": "description"
-    }
-  ],
-  "final_answer_spec": {
-    "type": "boolean|number|string|json",
-    "from": "artifact_key or literal_value"
-  },
-  "request_body": {
-    "email_key": "email",
-    "secret_key": "secret", 
-    "url_value": "url",
-    "answer_key": "answer"
-  }
-}
-
-IMPORTANT RULES:
-1. Submit URL must be extracted from the page text
-2. Tasks array contains the work to do (can be empty if answer is direct)
-3. final_answer_spec.from references an artifact key from tasks OR a literal value
-4. request_body keys are the NAMES of fields in the submission JSON
-5. Return ONLY valid JSON, no markdown wrapper, no extra text
-
-AVAILABLE TOOLS:
-- render_js_page(url): Render page and get text/links/code
-- fetch_text(url): Fetch text content
-- download_file(url): Download binary file
-- parse_csv(path OR url): Parse CSV from local path or URL
-- parse_excel/parse_json_file/parse_html_tables/parse_pdf_tables: Parse files
-- dataframe_ops(op, params): DataFrame operations
-- make_plot(spec): Create chart
-- zip_base64(paths): Create zip archive
-- call_llm(prompt, system_prompt, max_tokens, temperature): Call LLM
-"""
-    
-    prompt = f"""
-QUIZ PAGE DATA:
-Text: {page_data['text']}
-Code blocks: {page_data['code_blocks']}
-Links: {page_data['links']}
-HTML preview: {page_data['html'][:500]}...{previous_context}
-
-ANALYZE THIS QUIZ AND GENERATE THE EXECUTION PLAN JSON.
-
-Requirements:
-1. Find the submit URL (look for POST endpoint, /submit, /answer paths)
-2. Identify what answer is required (read the instruction text)
-3. Determine the answer type (boolean, number, string, json)
-4. Plan minimal tasks needed (often zero if answer is direct)
-5. Build the request_body structure with proper field names
-
-OUTPUT ONLY THE JSON PLAN, NO OTHER TEXT.
-"""
-    
-    OPEN_AI_BASE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
-    API_KEY = os.getenv("API_KEY")
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    json_data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
-        "max_tokens": 3000,
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        plan_text = data["choices"][0]["message"]["content"]
-        logger.info(f"[LLM_PLAN] Raw plan response: {plan_text[:500]}")
-        return plan_text
-
-async def check_plan_completion(plan_obj: Dict[str, Any], artifacts: Dict[str, Any], page_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Check if plan execution is complete"""
-    
-    # Quick check: if we have statistics results with actual values, we're done
-    for artifact_key, artifact_value in artifacts.items():
-        if isinstance(artifact_value, dict) and 'statistics' in artifact_value:
-            stats_dict = artifact_value.get('statistics', {})
-            if isinstance(stats_dict, dict):
-                for col_stats in stats_dict.values():
-                    if isinstance(col_stats, dict) and len(col_stats) > 0:
-                        # We have actual statistics values - answer is ready
-                        logger.info(f"[PLAN_COMPLETE] Found statistics in {artifact_key}: {col_stats}")
-                        return {
-                            "answer_ready": True,
-                            "needs_more_tasks": False,
-                            "reason": "Statistics calculated successfully",
-                            "recommended_next_action": "submit"
-                        }
-    
-    system_prompt = """
-        You are a strict task planner evaluating execution progress. Determine if the answer is ready to submit or if more tasks are needed.
-        
-        IMPORTANT: Only set answer_ready=true if you can ACTUALLY SEE the final answer value in the artifacts.
-        Do NOT make assumptions or hallucinate values you cannot see.
-        
-        Respond with JSON:
-        {
-            "answer_ready": boolean,
-            "needs_more_tasks": boolean,
-            "reason": "explanation",
-            "recommended_next_action": "what should be done next"
-        }
-        """
-    
-    artifacts_summary = {}
-    for key, value in artifacts.items():
-        if isinstance(value, (str, int, float, bool, list, dict)):
-            artifacts_summary[key] = value
-        else:
-            artifacts_summary[key] = str(value)[:500]
-    
-    prompt = f"""
-        Current Plan:
-        {json.dumps(plan_obj.get('final_answer_spec', {}), indent=2)}
-        
-        Produced Artifacts:
-        {json.dumps(artifacts_summary, indent=2)}
-        
-        Quiz Instructions:
-        {page_data.get('text', 'N/A')[:1000]}
-        
-        SMART EVALUATION:
-        1. The plan specifies we need artifact from "{plan_obj.get('final_answer_spec', {}).get('from', 'unknown')}"
-        2. Check if that artifact exists AND is a meaningful value (not HTML, not script tags, not a dict)
-        3. If NOT useful, check for alternatives:
-           - Look for "extracted_*", "rendered_*", or "secret_*" artifacts
-           - These might be better than the originally planned artifact
-        4. If any meaningful value exists (string with actual data), answer_ready=true
-        5. If only HTML/script/dicts exist, answer_ready=false
-        
-        Answer ready means: "We have a clean, meaningful value ready to submit, not HTML or code"
-        """
-    
-    response_text = await call_llm(prompt, system_prompt, 1000, 0)
-    
-    try:
-        cleaned_response = response_text.strip()
-        cleaned_response = re.sub(r'^```(?:json)?\s*\n?', '', cleaned_response)
-        cleaned_response = re.sub(r'\n?```$', '', cleaned_response)
-        result = json.loads(cleaned_response)
-    except json.JSONDecodeError:
-        result = {
-            "answer_ready": False,
-            "needs_more_tasks": True,
-            "reason": response_text,
-            "recommended_next_action": response_text
-        }
-    
-    return result
-
-async def generate_next_tasks(plan_obj: Dict[str, Any], artifacts: Dict[str, Any], page_data: Dict[str, Any], completion_status: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Generate next batch of tasks using LLM with function calling"""
-    
-    # Build context about what we have and what we need
-    artifacts_summary = {}
-    for key, value in artifacts.items():
-        if isinstance(value, str):
-            artifacts_summary[key] = value[:200] if len(value) > 200 else value
-        elif isinstance(value, dict):
-            # Don't truncate transcription text - it contains critical instructions
-            if 'transcribe' in key.lower() and 'text' in value:
-                artifacts_summary[key] = {k: v if k == 'text' else str(v)[:100] for k, v in list(value.items())[:10]}
-            else:
-                artifacts_summary[key] = {k: str(v)[:100] for k, v in list(value.items())[:5]}
-        else:
-            artifacts_summary[key] = str(value)[:200]
-    
-    # CRITICAL CHECK: If we have audio but no transcription, force it
-    has_audio_file = any('content_type' in str(v) and 'audio' in str(v).lower() for v in artifacts.values())
-    has_transcription = any('transcribe' in k.lower() for k in artifacts.keys())
-    
-    if has_audio_file and not has_transcription:
-        # Find the audio file path
-        audio_path = None
-        for key, value in artifacts.items():
-            if isinstance(value, dict) and value.get('content_type', '').startswith('audio'):
-                audio_path = value.get('path')
-                break
-        
-        if audio_path:
-            logger.info(f"[FORCE_TRANSCRIBE] Audio file found but not transcribed. Forcing transcribe_audio with path: {audio_path}")
-            return [{
-                "id": f"forced_transcribe_{len(artifacts)}",
-                "tool_name": "transcribe_audio",
-                "inputs": {"audio_path": audio_path},
-                "produces": [{"key": f"transcribe_audio_result_{len(artifacts)}", "type": "json"}],
-                "notes": "Forced transcription of audio file"
-            }]
-    
-    # CRITICAL CHECK: If we have transcription mentioning CSV but no dataframe, force parse_csv
-    has_dataframe = any('dataframe_key' in str(v) for v in artifacts.values())
-    transcription_mentions_csv = False
-    transcription_text = None
-    
-    for key, value in artifacts.items():
-        if 'transcribe' in key.lower() and isinstance(value, dict):
-            transcription_text = value.get('text', '').lower()
-            if 'csv' in transcription_text or 'data' in transcription_text or 'file' in transcription_text:
-                transcription_mentions_csv = True
-            break
-    
-    if has_transcription and transcription_mentions_csv and not has_dataframe:
-        # Find CSV link in page
-        csv_link = None
-        for link in page_data.get('links', []):
-            if isinstance(link, str) and '.csv' in link.lower():
-                csv_link = link
-                break
-        
-        if csv_link:
-            logger.info(f"[FORCE_PARSE_CSV] Transcription mentions CSV but no dataframe found. Forcing parse_csv for {csv_link}")
-            return [{
-                "id": f"forced_parse_csv_{len(artifacts)}",
-                "tool_name": "parse_csv",
-                "inputs": {"url": csv_link},
-                "produces": [{"key": f"parse_csv_result_{len(artifacts)}", "type": "json"}],
-                "notes": "Forced CSV parsing based on transcription"
-            }]
-    
-
-    system_prompt = """You are a task planner that MUST use function calling to specify next steps.
-
-IMPORTANT CONSTRAINTS:
-- You MUST call tools using function calling - do NOT respond with text explanations
-- Keep reasoning minimal - just enough to track what you're doing
-- Focus on ACTION, not explanation
-
-Understanding multi-step workflows:
-- When instructions mention filtering/selecting a subset of data, you must FIRST filter the data (creates new dataframe), THEN perform calculations on the filtered result
-- Example: "sum values >= 100" requires TWO steps:
-  1. dataframe_ops(op="filter", params={"dataframe_key": "df_0", "condition": "column >= 100"}) → creates df_1
-  2. calculate_statistics(dataframe="df_1", stats=["sum"]) → calculates sum on filtered data
-- Do NOT calculate statistics on the original dataframe if filtering is required
-
-Tool chaining:
-- parse_csv → returns dataframe_key (e.g., "df_0")
-- dataframe_ops with filter → returns NEW dataframe_key (e.g., "df_1")  
-- calculate_statistics → uses the appropriate dataframe_key (filtered or original)"""
-
-    # Extract transcription text if available for better prompting
-    transcription_text = None
-    for key, value in artifacts.items():
-        if 'transcribe' in key.lower() and isinstance(value, dict):
-            transcription_text = value.get('text', '')
-            break
-    
-    # Check what we have and what we're missing
-    has_statistics = any('statistics' in str(v) for v in artifacts.values())
-    has_dataframe = any('dataframe_key' in str(v) for v in artifacts.values())
-    
-    prompt = f"""
-STATE:
-Artifacts: {json.dumps(artifacts_summary, indent=2)}
-
-Page text: {page_data.get('text', 'N/A')[:500]}
-Links: {page_data.get('links', [])}
-
-{f'''INSTRUCTIONS FROM AUDIO/TEXT:
-"{transcription_text}"
-
-Available tools for data operations:
-- dataframe_ops(op="filter", params={{"dataframe_key": "df_X", "condition": "column >= value"}})
-- calculate_statistics(dataframe="df_X", stats=["sum", "mean", "median", "count", etc.])
-
-Current state: Transcription ✓, Data {"✓" if has_dataframe else "✗"}, Calculations {"✓" if has_statistics else "✗"}
-''' if transcription_text else ''}
-
-TASK: Based on the instructions above, call the necessary tools to complete the task.
-Use function calling - do NOT write text explanations.
-
-Your reasoning should be brief. Focus on CALLING TOOLS, not explaining.
-"""
-
-    logger.info(f"[GENERATE_NEXT_TASKS] Transcription text: {transcription_text}")
-    logger.info(f"[GENERATE_NEXT_TASKS] Artifacts summary keys: {list(artifacts_summary.keys())}")
-    logger.info(f"[GENERATE_NEXT_TASKS] Has statistics: {has_statistics}, Has dataframe: {has_dataframe}")
-    logger.info(f"[GENERATE_NEXT_TASKS] Full prompt sent to LLM:\n{prompt}")
-
-    # Force tool usage if we have data but no calculations yet
-    # This prevents the LLM from saying "no tasks needed" when calculations are still required
-    force_tool_usage = has_dataframe and not has_statistics and transcription_text
-    tool_choice_param = "required" if force_tool_usage else "auto"
-    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (forced={force_tool_usage})")
-
-    OPEN_AI_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
-    API_KEY = os.getenv("API_KEY")
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    
-    # Get tool definitions (reuse from call_llm_with_tools)
-    tools = get_tool_definitions()
-    
-    json_data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "tools": tools,
-        "tool_choice": tool_choice_param,
-        "temperature": 0,
-        "max_tokens": 2000,
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
-            response.raise_for_status()
-            data = response.json()
-            
-            message = data["choices"][0]["message"]
-            logger.info(f"[GENERATE_NEXT_TASKS] LLM response message: {message}")
-            
-            # Check if model wants to call tools
-            if message.get("tool_calls"):
-                logger.info(f"[NEXT_TASKS] Model requested {len(message['tool_calls'])} additional tool call(s)")
-                
-                # Convert tool calls to task format
-                next_tasks = []
-                for i, tool_call in enumerate(message["tool_calls"]):
-                    func_name = tool_call["function"]["name"]
-                    raw_args = tool_call["function"]["arguments"]
-                    
-                    # Clean up malformed JSON from o1 model (reasoning tokens leak into JSON)
-                    # Remove common garbage patterns like: }})```? or trailing junk
-                    cleaned_args = raw_args
-                    
-                    # Remove markdown code block markers
-                    cleaned_args = re.sub(r'```[a-z]*\??', '', cleaned_args)
-                    
-                    # Fix common patterns where closing braces are duplicated
-                    cleaned_args = re.sub(r'\}\}+\)', '}', cleaned_args)
-                    cleaned_args = re.sub(r'\}\}+', '}', cleaned_args)
-                    
-                    # Remove trailing question marks and other junk after closing braces
-                    cleaned_args = re.sub(r'\}[^\}]*$', '}', cleaned_args)
-                    
-                    try:
-                        func_args = json.loads(cleaned_args)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"[NEXT_TASK_{i+1}] Failed to parse arguments after cleanup: {e}")
-                        logger.error(f"[NEXT_TASK_{i+1}] Raw: {raw_args}")
-                        logger.error(f"[NEXT_TASK_{i+1}] Cleaned: {cleaned_args}")
-                        # Try original as last resort
-                        func_args = json.loads(raw_args)
-                    
-                    # Clean string values - remove trailing junk
-                    for key, value in func_args.items():
-                        if isinstance(value, str):
-                            # Remove common junk patterns from string values
-                            value = re.sub(r'\}\}+.*$', '', value)  # Remove }})... 
-                            value = re.sub(r'```.*$', '', value)     # Remove ```...
-                            value = value.rstrip('.,;:"\' ?')        # Remove trailing punctuation
-                            func_args[key] = value
-                    
-                    # Recursively clean nested dicts (like params)
-                    if "params" in func_args and isinstance(func_args["params"], dict):
-                        for key, value in func_args["params"].items():
-                            if isinstance(value, str):
-                                value = re.sub(r'\}\}+.*$', '', value)
-                                value = re.sub(r'```.*$', '', value)
-                                value = value.rstrip('.,;:"\' ?')
-                                func_args["params"][key] = value
-                    
-                    logger.info(f"[NEXT_TASK_{i+1}] {func_name} with args: {func_args}")
-                    
-                    next_tasks.append({
-                        "id": f"next_task_{i+1}",
-                        "tool_name": func_name,
-                        "inputs": func_args,
-                        "produces": [{"key": f"{func_name}_result_{i+1}", "type": "json"}],
-                        "notes": f"Follow-up task: {func_name}"
-                    })
-                
-                return next_tasks
-            else:
-                logger.warning(f"[NEXT_TASKS] LLM did not call any tools despite tool_choice=required")
-                logger.info(f"[NEXT_TASKS] No additional tasks needed")
-                return []
-                
-    except Exception as e:
-        logger.error(f"[NEXT_TASKS] Error generating tasks: {e}")
-        return []
 
 async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, page_data: Dict[str, Any] = None, quiz_attempt: QuizAttempt = None) -> Dict[str, Any]:
     """Execute the LLM-generated plan with iterative task batches"""
@@ -1809,7 +36,7 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
         artifacts = {}
         execution_log = []
         all_tasks = plan.get("tasks", [])
-        max_iterations = 5
+        max_iterations = 10
         iteration = 0
         
         if quiz_attempt:
@@ -2085,6 +312,29 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                     })
                     raise
             
+            # Format complex artifacts to extract meaningful values
+            # This helps the completion checker understand if we have the answer
+            if page_data and artifacts:
+                page_instructions = page_data.get('text', '')
+                formatted_artifacts = {}
+                
+                for key, value in artifacts.items():
+                    # Skip if already extracted
+                    extracted_key = f"extracted_{key}"
+                    if extracted_key in artifacts:
+                        continue
+                    
+                    # Only format the most recent artifacts (avoid re-processing old ones)
+                    if any(task['iteration'] == iteration for task in execution_log if key in [p for produces in [t.get('produces', []) for t in all_tasks] for p in produces]):
+                        formatted_value = await format_artifact(key, value, page_instructions)
+                        if formatted_value != value:
+                            # Store formatted version with new key
+                            formatted_artifacts[extracted_key] = formatted_value
+                            logger.info(f"[ARTIFACT_FORMAT] Created {extracted_key}: {str(formatted_value)[:100]}")
+                
+                # Add formatted artifacts to the collection
+                artifacts.update(formatted_artifacts)
+            
             logger.info("Checking if execution is complete...")
             
             if len(all_tasks) == 0:
@@ -2119,50 +369,79 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
         
         logger.info("Preparing final answer for submission")
         
-        # First try to get the specified artifact
+        # Get the plan's specified artifact key
         from_key = final_spec.get("from", "")
         candidate_artifacts = {}
+        alternative_artifact = None  # Cache for PRIORITY 3
         
-        if from_key:
+        # Single pass through artifacts - check all priorities at once
+        for key in sorted(artifacts.keys(), reverse=True):
+            value = artifacts[key]
+            
+            # PRIORITY 1: Statistics results (highest priority)
+            if isinstance(value, dict) and 'statistics' in value:
+                logger.info(f"[ARTIFACT_SELECTION] Found statistics result (HIGHEST PRIORITY): {key}")
+                candidate_artifacts = {key: value}
+                break  # Statistics found - stop searching
+            
+            # PRIORITY 3: Cache first good alternative (only if no statistics found yet)
+            if not alternative_artifact:
+                # Check string artifacts
+                if isinstance(value, str) and len(value) < 500 and len(value) > 2:
+                    if not ('<' in value or 'script' in value.lower()):
+                        prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_')
+                        if any(key.startswith(p) for p in prefixes):
+                            alternative_artifact = (key, value)
+                # Check dict artifacts with 'text' field (e.g., rendered_page_X)
+                elif isinstance(value, dict) and 'text' in value:
+                    text_content = value.get('text', '')
+                    if isinstance(text_content, str) and len(text_content.strip()) > 5:
+                        if not ('<' in text_content or 'script' in text_content.lower()):
+                            prefixes = ('rendered_', 'scraped_', 'extracted_', 'result_')
+                            if any(key.startswith(p) for p in prefixes):
+                                alternative_artifact = (key, value)
+        
+        # PRIORITY 2: If no statistics, try the specified artifact
+        if not candidate_artifacts and from_key:
             cleaned_key = from_key.strip()
             cleaned_key = re.sub(r"^static value\s*['\"]?|['\"]?$", "", cleaned_key)
             cleaned_key = re.sub(r"^['\"]|['\"]$", "", cleaned_key).strip()
             
             if from_key in artifacts:
-                candidate_artifacts[from_key] = artifacts[from_key]
+                value = artifacts[from_key]
+                # Check if it's useful (not HTML/script)
+                is_useless = False
+                if isinstance(value, str) and ('<' in value or 'script' in value.lower()):
+                    is_useless = True
+                elif isinstance(value, dict) and 'content' in value:
+                    # Dict with 'content' field that has HTML
+                    content = value.get('content', '')
+                    if isinstance(content, str) and ('<' in content or 'script' in content.lower()):
+                        is_useless = True
+                
+                if not is_useless:
+                    candidate_artifacts[from_key] = value
             elif cleaned_key in artifacts:
-                candidate_artifacts[cleaned_key] = artifacts[cleaned_key]
+                value = artifacts[cleaned_key]
+                # Same checks for cleaned key
+                is_useless = False
+                if isinstance(value, str) and ('<' in value or 'script' in value.lower()):
+                    is_useless = True
+                elif isinstance(value, dict) and 'content' in value:
+                    content = value.get('content', '')
+                    if isinstance(content, str) and ('<' in content or 'script' in content.lower()):
+                        is_useless = True
+                
+                if not is_useless:
+                    candidate_artifacts[cleaned_key] = value
         
-        # If the specified artifact is not useful (HTML/script/dict), look for better alternatives
-        # Prioritize: statistics results, then extracted_*, rendered_*, scraped_*, secret_* artifacts
-        if not candidate_artifacts or all(isinstance(v, dict) and 'statistics' not in v or (isinstance(v, str) and ('<' in v or 'script' in v.lower())) for v in candidate_artifacts.values()):
-            logger.info("[ARTIFACT_SELECTION] Specified artifact not useful, searching for better alternatives...")
-            
-            # First check for statistics results (highest priority)
-            for key in sorted(artifacts.keys(), reverse=True):
-                value = artifacts[key]
-                if isinstance(value, dict) and 'statistics' in value:
-                    logger.info(f"[ARTIFACT_SELECTION] Found statistics result: {key}")
-                    candidate_artifacts[key] = value
-                    break
-            
-            # If no statistics found, look for string artifacts
-            if not candidate_artifacts:
-                for key in sorted(artifacts.keys(), reverse=True):
-                    value = artifacts[key]
-                    # Skip HTML, script tags, and dict objects (except statistics)
-                    if isinstance(value, dict):
-                        continue
-                    if isinstance(value, str) and ('<' in value or 'script' in value.lower()):
-                        continue
-                    # Prefer ANY meaningful artifact (not just extracted/secret)
-                    # This includes rendered_*, scraped_*, extracted_*, secret_*
-                    if isinstance(value, str) and len(value) < 500 and len(value) > 2:
-                        prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_')
-                        if any(key.startswith(p) for p in prefixes):
-                            logger.info(f"[ARTIFACT_SELECTION] Found alternative: {key} = {value[:100]}")
-                            candidate_artifacts[key] = value
-                            break  # Take the first (newest) good alternative
+        # PRIORITY 3: Use cached alternative if plan's artifact wasn't useful
+        if not candidate_artifacts and alternative_artifact:
+            key, value = alternative_artifact
+            # Safe logging for both string and dict values
+            log_value = str(value)[:100] if isinstance(value, dict) else value[:100]
+            logger.info(f"[ARTIFACT_SELECTION] Using alternative: {key} = {log_value}")
+            candidate_artifacts[key] = value
         
         # Select best artifact
         if candidate_artifacts:
@@ -2208,13 +487,17 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 logger.info(f"[ARTIFACT_EXTRACTION] Extracted 'mean': {final_answer}")
                             else:
                                 final_answer = next(iter(col_stats.values()))
-                                if hasattr(final_answer, 'item'):
-                                    final_answer = final_answer.item()
-                                logger.info(f"[ARTIFACT_EXTRACTION] Extracted first stat: {final_answer}")
-                    else:
-                        logger.warning(f"[ARTIFACT_EXTRACTION] Empty statistics dict for column {first_col}")
+            
+            # Handle dataframe_ops result format: {'result': value, 'type': 'typename'}
+            if isinstance(final_answer, dict) and 'result' in final_answer and 'type' in final_answer:
+                result_value = final_answer['result']
+                # Handle numpy types
+                if hasattr(result_value, 'item'):
+                    result_value = result_value.item()
+                logger.info(f"[ARTIFACT_EXTRACTION] Extracted result value: {result_value}")
+                final_answer = result_value
             # Actual dict object with 'text' key
-            elif 'text' in final_answer:
+            elif isinstance(final_answer, dict) and 'text' in final_answer:
                 logger.info(f"[ARTIFACT_EXTRACTION] Extracting 'text' from dict object")
                 final_answer = final_answer['text']
                 logger.info(f"[ARTIFACT_EXTRACTION] Extracted: {str(final_answer)[:100]}...")
@@ -2273,62 +556,62 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
             else:
                 final_answer = "completed"
         
-        # Execute final submission
-        submit_url = plan.get("submit_url")
+        # Submit answer
+        logger.info(f"Final answer ready for submission: {final_answer}")
+        
+        if quiz_attempt:
+            quiz_attempt.answer = final_answer
+        
+        # Build submission payload
         request_body_spec = plan.get("request_body", {})
-        submission_result = None
+        submit_url = plan.get("submit_url", "")
         
-        logger.info(f"[SUBMISSION_PREP] Submit URL: {submit_url}")
-        logger.info(f"[SUBMISSION_PREP] Email: {email}")
-        logger.info(f"[SUBMISSION_PREP] Origin URL: {origin_url}")
+        # Build submission body using old executor logic
+        submit_body = {}
         
-        if submit_url and request_body_spec:
-            submission_body = {}
+        if request_body_spec:
             email_key = request_body_spec.get("email_key", "email")
-            submission_body[email_key] = email
-            logger.info(f"[SUBMISSION_BUILD] Email key: {email_key}")
+            submit_body[email_key] = email
             
             secret_key = request_body_spec.get("secret_key", "secret")
-            submission_body[secret_key] = get_secret()
-            logger.info(f"[SUBMISSION_BUILD] Secret key: {secret_key}")
+            submit_body[secret_key] = get_secret()
             
             url_key = request_body_spec.get("url_value", "url")
             if url_key:
-                submission_body[url_key] = origin_url
-                logger.info(f"[SUBMISSION_BUILD] URL key: {url_key}")
+                submit_body[url_key] = origin_url
             
             answer_key = request_body_spec.get("answer_key", "answer")
-            submission_body[answer_key] = final_answer
-            logger.info(f"[SUBMISSION_BUILD] Answer key: {answer_key}")
-            logger.info(f"[SUBMISSION_BUILD] Final answer: {final_answer}")
-            
-            logger.info(f"[FINAL_SUBMISSION_BODY] {json.dumps(submission_body, indent=2)}")
-            submission_result = await answer_submit(submit_url, submission_body)
-            
-            if quiz_attempt:
-                quiz_attempt.submission_response = submission_result.get("response", {}) if submission_result else None
-                quiz_attempt.correct = submission_result.get("response", {}).get("correct") if submission_result else None
-                quiz_attempt.answer = final_answer
-                quiz_attempt.artifacts = artifacts
-                quiz_attempt.execution_log = execution_log
+            submit_body[answer_key] = final_answer
+        
+        logger.info(f"Submitting answer to {submit_url}")
+        logger.info(f"Request body: {json.dumps(submit_body, indent=2)}")
+        
+        submission_result = await answer_submit(submit_url, submit_body)
+        
+        if quiz_attempt:
+            quiz_attempt.submission_response = submission_result.get("response", {})
+            quiz_attempt.correct = submission_result.get("response", {}).get("correct", False)
         
         return {
             "success": True,
             "final_answer": final_answer,
-            "final_answer_type": final_spec.get("type"),
             "submission_result": submission_result,
+            "artifacts": artifacts,
             "execution_log": execution_log,
-            "artifacts_count": len(artifacts)
+            "iterations_used": iteration
         }
         
     except Exception as e:
         logger.error(f"Plan execution failed: {e}")
+        import traceback
+        traceback.print_exc()
         if quiz_attempt:
             quiz_attempt.error = str(e)
         return {
             "success": False,
             "error": str(e),
-            "execution_log": execution_log
+            "artifacts": artifacts if 'artifacts' in locals() else {},
+            "execution_log": execution_log if 'execution_log' in locals() else []
         }
 
 
@@ -2338,270 +621,147 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
     Handles multiple sequential quizzes and retry logic
     """
     try:
-        logger.info(f"[PIPELINE] Starting pipeline for {email} at {url}")
-        
-        current_url = url
-        quiz_chain = []
         quiz_runs = {}
-        max_chain_iterations = 10
+        quiz_chain = []
+        current_url = url
         
-        while len(quiz_chain) < max_chain_iterations:
-            logger.info(f"=== Processing Quiz: {current_url} ===")
+        while True:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"SOLVING QUIZ: {current_url}")
+            logger.info(f"{'='*60}\n")
             
-            # Get or create quiz run tracker for this URL
+            # Initialize QuizRun for this URL
             if current_url not in quiz_runs:
-                quiz_runs[current_url] = QuizRun(current_url)
-                logger.info(f"[QUIZ_RUN] New quiz run created for {current_url}")
+                quiz_runs[current_url] = QuizRun(quiz_url=current_url)
             
             quiz_run = quiz_runs[current_url]
             
-            # Start a new attempt
-            quiz_attempt = quiz_run.start_attempt()
-            logger.info(f"[QUIZ_RUN] Starting attempt {quiz_attempt.attempt_number}")
-            
-            # Render page
-            logger.info(f"[QUIZ_RUN] Rendering page for attempt {quiz_attempt.attempt_number}")
-            page_data = await render_page(current_url)
-            logger.info(f"[QUIZ_RUN_PAGE] Rendered page - text length: {len(page_data.get('text', ''))}, links: {len(page_data.get('links', []))}")
-            
-            # Generate execution plan using function calling
-            logger.info(f"[QUIZ_RUN] Generating execution plan for attempt {quiz_attempt.attempt_number}")
-            llm_response = await call_llm_with_tools(page_data, quiz_run.attempts[:-1])  # Pass previous attempts
-            logger.info(f"[LLM_TOOLS_RESPONSE] Tool calls: {llm_response.get('tool_calls') is not None}, Content: {str(llm_response.get('content', ''))[:200]}")
-            
-            # Build plan object from LLM response
-            plan_obj = {
-                "submit_url": "https://tds-llm-analysis.s-anand.net/submit",  # Default, should be extracted from page
-                "origin_url": current_url,
-                "tasks": llm_response.get("tasks", []),
-                "final_answer_spec": {
-                    "type": "string",
-                    "from": None  # Will be determined based on tasks or content
-                },
-                "request_body": {
-                    "email_key": "email",
-                    "secret_key": "secret",
-                    "url_value": "url",
-                    "answer_key": "answer"
-                }
-            }
-            
-            # If tasks exist, set final_answer_spec to reference the last task's output
-            if plan_obj["tasks"]:
-                last_task = plan_obj["tasks"][-1]
-                if last_task.get("produces"):
-                    # Reference the key from the last task's produces
-                    output_key = last_task["produces"][0]["key"]
-                    plan_obj["final_answer_spec"]["from"] = output_key
-                    logger.info(f"[QUIZ_PLAN] Set final answer to reference artifact: {output_key}")
-            
-            # If no tasks and model gave direct content, use that as answer
-            if not plan_obj["tasks"] and llm_response.get("content"):
-                logger.info(f"[QUIZ_PLAN] Direct answer from LLM: {str(llm_response['content'])[:100]}")
-                plan_obj["final_answer_spec"]["from"] = str(llm_response["content"])
-            
-            # FALLBACK: If LLM didn't call tools but there are links or audio, force smart scraping
-            if not plan_obj["tasks"]:
-                # First check for audio files
-                if page_data.get("audio_sources"):
-                    logger.warning(f"[QUIZ_PLAN] LLM did not call tools but page has {len(page_data['audio_sources'])} audio sources. Forcing audio download.")
-                    for i, audio_url in enumerate(page_data['audio_sources'][:1]):  # Just first audio
-                        if audio_url and audio_url.startswith('http'):
-                            plan_obj["tasks"].append({
-                                "id": f"forced_audio_task_{i+1}",
-                                "tool_name": "download_file",
-                                "inputs": {"url": audio_url},
-                                "produces": [{"key": f"download_file_result_{i+1}", "type": "json"}],
-                                "notes": f"Forced download of audio: {audio_url}"
-                            })
-                            # Update final answer to reference this result
-                            plan_obj["final_answer_spec"]["from"] = f"download_file_result_{i+1}"
+            # Retry loop for incorrect answers
+            while True:
+                # Create new attempt
+                quiz_attempt = quiz_run.start_attempt()
+                logger.info(f"[QUIZ_RUN] Starting attempt {quiz_attempt.attempt_number} for {current_url}")
                 
-                # Then check for data file links
-                if not plan_obj["tasks"] and page_data.get("links"):
-                    logger.warning(f"[QUIZ_PLAN] LLM did not call tools but page has {len(page_data['links'])} links. Forcing smart scraping.")
-                    for i, link in enumerate(page_data['links'][:3]):  # Limit to first 3 links
-                        if link and link.startswith('http'):
-                            # Check file extension to choose appropriate tool
-                            link_lower = link.lower()
-                            if '.csv' in link_lower:
-                                tool_name = "parse_csv"
-                                result_key = f"csv_data_{i+1}"
-                                logger.info(f"[QUIZ_PLAN] Forcing CSV parse: {link}")
-                            elif '.xlsx' in link_lower or '.xls' in link_lower:
-                                tool_name = "parse_excel"
-                                result_key = f"excel_data_{i+1}"
-                                logger.info(f"[QUIZ_PLAN] Forcing Excel parse: {link}")
-                            elif '.json' in link_lower:
-                                tool_name = "parse_json_file"
-                                result_key = f"json_data_{i+1}"
-                                logger.info(f"[QUIZ_PLAN] Forcing JSON parse: {link}")
-                            else:
-                                tool_name = "render_js_page"
-                                result_key = f"scraped_content_{i+1}"
-                                logger.info(f"[QUIZ_PLAN] Forcing page render: {link}")
-                            
-                            plan_obj["tasks"].append({
-                                "id": f"forced_task_{i+1}",
-                                "tool_name": tool_name,
-                                "inputs": {"url": link} if tool_name == "parse_csv" else {"url": link} if tool_name == "render_js_page" else {"path": link},
-                                "produces": [{"key": result_key, "type": "json"}],
-                                "notes": f"Forced {tool_name} of link: {link}"
-                            })
+                # Render page
+                logger.info(f"[QUIZ_RUN] Rendering quiz page")
+                page_data = await render_page(current_url)
+                logger.info(f"[QUIZ_RUN] Page rendered - text length: {len(page_data.get('text', ''))}")
                 
-                # Update final answer to reference last result
-                if plan_obj["tasks"]:
-                    plan_obj["final_answer_spec"]["from"] = plan_obj["tasks"][-1]["produces"][0]["key"]
+                # Generate execution plan
+                logger.info(f"[QUIZ_RUN] Generating execution plan")
+                plan_response = await call_llm_for_plan(page_data, quiz_run.attempts[:-1] if len(quiz_run.attempts) > 1 else None)
+                plan_json = extract_json_from_markdown(plan_response)
                 
-            # ADDITIONAL FALLBACK: If we parsed data files AND page explicitly asks for analysis
-            # This runs AFTER the link scraping fallback above
-            page_text_lower = page_data.get("text", "").lower()
-            data_tasks = [t for t in plan_obj["tasks"] if t["tool_name"] in ["parse_csv", "parse_excel", "parse_json_file"]]
-            
-            # Only add analysis if the page EXPLICITLY mentions analysis operations
-            analysis_keywords = ["sum", "total", "count", "average", "mean", "filter", "calculate", "add up", "compute"]
-            needs_analysis = any(keyword in page_text_lower for keyword in analysis_keywords)
-            
-            logger.info(f"[FALLBACK_CHECK] Found {len(data_tasks)} data parsing tasks")
-            
-            # If we parsed data AND page asks for analysis, add analysis step
-            if data_tasks and needs_analysis:
-                logger.info(f"[QUIZ_PLAN] Data file parsed. Adding analysis task (raw dataframe is never the answer).")
+                try:
+                    plan_obj = json.loads(plan_json)
+                    logger.info(f"[QUIZ_RUN] Plan parsed successfully")
+                except json.JSONDecodeError as e:
+                    logger.error(f"[QUIZ_RUN] Failed to parse plan JSON: {e}")
+                    logger.error(f"[QUIZ_RUN] Raw plan response: {plan_response}")
+                    quiz_attempt.error = f"Failed to parse plan: {e}"
+                    quiz_attempt.finish()
+                    quiz_run.finish_current_attempt()
+                    return {
+                        "success": False,
+                        "error": f"Failed to parse execution plan: {e}",
+                        "quiz_runs": {url: qr.to_dict() for url, qr in quiz_runs.items()}
+                    }
                 
-                # Determine which analysis to add based on keywords
-                if "sum" in page_text_lower or "total" in page_text_lower or "add" in page_text_lower:
-                    stats_to_compute = ["sum"]
-                    analysis_type = "sum"
-                elif "count" in page_text_lower:
-                    stats_to_compute = ["count"]
-                    analysis_type = "count"
-                elif "average" in page_text_lower or "mean" in page_text_lower:
-                    stats_to_compute = ["mean"]
-                    analysis_type = "mean"
-                else:
-                    # Default: compute sum (most common for numeric data)
-                    stats_to_compute = ["sum"]
-                    analysis_type = "sum (default)"
+                # Add previous attempts context if this is a retry
+                previous_attempts_context = ""
+                if len(quiz_run.attempts) > 1:
+                    previous_attempts_context = "\n\nPREVIOUS ATTEMPTS:"
+                    for prev_attempt in quiz_run.attempts[:-1]:  # Exclude current attempt
+                        previous_attempts_context += f"\nAttempt {prev_attempt.attempt_number}:\n"
+                        previous_attempts_context += f"  - Answer: {prev_attempt.answer}\n"
+                        previous_attempts_context += f"  - Result: {'Correct' if prev_attempt.correct else 'Incorrect'}\n"
+                        if prev_attempt.error:
+                            previous_attempts_context += f"  - Error: {prev_attempt.error}\n"
+                    logger.info(f"[QUIZ_RUN] Context from {len(quiz_run.attempts)-1} previous attempts prepared")
                 
-                analysis_task = {
-                    "id": f"forced_analysis_1",
-                    "tool_name": "calculate_statistics",
-                    "inputs": {
-                        "dataframe": "df_0",  # DataFrame key from registry
-                        "columns": [],  # Empty means all columns
-                        "stats": stats_to_compute
-                    },
-                    "produces": [{"key": "analysis_result_1", "type": "json"}],
-                    "notes": f"Forced analysis: calculate {analysis_type} of data"
-                }
+                # Execute plan with attempt tracking
+                logger.info(f"[QUIZ_RUN] Executing plan for attempt {quiz_attempt.attempt_number}")
+                execution_result = await execute_plan(plan_obj, email, current_url, page_data, quiz_attempt)
+                logger.info(f"[QUIZ_EXECUTION] Execution result: success={execution_result.get('success')}, final_answer={execution_result.get('final_answer')}")
                 
-                plan_obj["tasks"].append(analysis_task)
-                plan_obj["final_answer_spec"]["from"] = "analysis_result_1"
-                logger.info(f"[QUIZ_PLAN] Added forced analysis task: calculate {analysis_type}")
-            
-            # Try to extract submit URL from page data
-            if "submit" in page_data.get("text", "").lower():
-                submit_match = re.search(r'(https?://[^\s]+/submit[^\s]*)', page_data.get("text", ""))
-                if submit_match:
-                    plan_obj["submit_url"] = submit_match.group(1)
-                    logger.info(f"[QUIZ_PLAN] Extracted submit URL: {plan_obj['submit_url']}")
-            
-            tasks_count = len(plan_obj.get("tasks", []))
-            logger.info(f"[QUIZ_RUN] Plan created with {tasks_count} tasks")
-            logger.info(f"[QUIZ_PLAN] Full plan: {json.dumps(plan_obj, indent=2)[:1000]}")
-            
-            # Store plan in attempt
-            quiz_attempt.plan = plan_obj
-            
-            # If this is a retry, provide context from previous attempts
-            previous_attempts_context = ""
-            if quiz_attempt.attempt_number > 1:
-                logger.info(f"[QUIZ_RUN] This is attempt {quiz_attempt.attempt_number}, analyzing previous attempts...")
-                previous_attempts_context = "\n\nPrevious attempts:\n"
-                for prev_attempt in quiz_run.attempts[:-1]:  # Exclude current attempt
-                    previous_attempts_context += f"\nAttempt {prev_attempt.attempt_number}:\n"
-                    previous_attempts_context += f"  - Answer: {prev_attempt.answer}\n"
-                    previous_attempts_context += f"  - Result: {'Correct' if prev_attempt.correct else 'Incorrect'}\n"
-                    if prev_attempt.error:
-                        previous_attempts_context += f"  - Error: {prev_attempt.error}\n"
-                logger.info(f"[QUIZ_RUN] Context from {len(quiz_run.attempts)-1} previous attempts prepared")
-            
-            # Execute plan with attempt tracking
-            logger.info(f"[QUIZ_RUN] Executing plan for attempt {quiz_attempt.attempt_number}")
-            execution_result = await execute_plan(plan_obj, email, current_url, page_data, quiz_attempt)
-            logger.info(f"[QUIZ_EXECUTION] Execution result: success={execution_result.get('success')}, final_answer={execution_result.get('final_answer')}")
-            
-            quiz_attempt.finish()
-            
-            if not execution_result.get("success"):
-                logger.error(f"[QUIZ_RUN] Execution failed at attempt {quiz_attempt.attempt_number}")
+                quiz_attempt.finish()
+                
+                if not execution_result.get("success"):
+                    logger.error(f"[QUIZ_RUN] Execution failed at attempt {quiz_attempt.attempt_number}")
+                    quiz_run.finish_current_attempt()
+                    return {
+                        "success": False,
+                        "error": execution_result.get("error", "Unknown error"),
+                        "quiz_runs": {url: qr.to_dict() for url, qr in quiz_runs.items()}
+                    }
+                
+                # Check submission response
+                submission_response = execution_result.get("submission_result", {})
+                response_data = submission_response.get("response", {}) if submission_response else {}
+                
+                logger.info(f"[QUIZ_RESPONSE] Submission response: {submission_response}")
+                logger.info(f"[QUIZ_RESPONSE] Full response data: {json.dumps(response_data, indent=2)}")
+                
+                # Check if answer was correct
+                is_correct = response_data.get("correct", False)
+                logger.info(f"[QUIZ_RESPONSE] Answer correct: {is_correct}")
+                
+                # Store attempt results
+                quiz_attempt.submission_response = response_data
+                quiz_attempt.correct = is_correct
                 quiz_run.finish_current_attempt()
-                return {
-                    "success": False,
-                    "error": execution_result.get("error", "Unknown error"),
-                    "quiz_runs": {url: qr.to_dict() for url, qr in quiz_runs.items()}
-                }
-            
-            # Check submission response
-            submission_response = execution_result.get("submission_result", {})
-            response_data = submission_response.get("response", {}) if submission_response else {}
-            
-            logger.info(f"[QUIZ_RESPONSE] Submission response: {submission_response}")
-            logger.info(f"[QUIZ_RESPONSE] Full response data: {json.dumps(response_data, indent=2)}")
-            
-            # Check if answer was correct
-            is_correct = response_data.get("correct", False)
-            logger.info(f"[QUIZ_RESPONSE] Answer correct: {is_correct}")
-            
-            # Store attempt results
-            quiz_attempt.submission_response = response_data
-            quiz_attempt.correct = is_correct
-            quiz_run.finish_current_attempt()
-            
-            if is_correct:
-                logger.info(f"[QUIZ_SUCCESS] Quiz solved successfully on attempt {quiz_attempt.attempt_number}")
                 
-                # Check if there's a next quiz URL
-                if "url" in response_data and response_data["url"]:
-                    next_url = response_data["url"]
-                    logger.info(f"[QUIZ_CHAIN] Next quiz found at: {next_url}")
-                    current_url = next_url
+                if is_correct:
+                    logger.info(f"[QUIZ_SUCCESS] Quiz solved successfully on attempt {quiz_attempt.attempt_number}")
                     
-                    # Add successful run to chain
-                    quiz_chain.append({
-                        "quiz_url": current_url,
-                        "quiz_run": quiz_run.to_dict()
-                    })
+                    # Check if there's a next quiz URL
+                    if "url" in response_data and response_data["url"]:
+                        next_url = response_data["url"]
+                        logger.info(f"[QUIZ_CHAIN] Next quiz found at: {next_url}")
+                        current_url = next_url
+                        
+                        # Add successful run to chain
+                        quiz_chain.append({
+                            "quiz_url": current_url,
+                            "quiz_run": quiz_run.to_dict()
+                        })
+                    else:
+                        logger.info("[QUIZ_COMPLETE] No next quiz URL. Quiz chain complete!")
+                        quiz_chain.append({
+                            "quiz_url": current_url,
+                            "quiz_run": quiz_run.to_dict()
+                        })
+                        break
                 else:
-                    logger.info("[QUIZ_COMPLETE] No next quiz URL. Quiz chain complete!")
-                    quiz_chain.append({
-                        "quiz_url": current_url,
-                        "quiz_run": quiz_run.to_dict()
-                    })
-                    break
+                    # Answer was incorrect, check if we can retry
+                    elapsed_time = quiz_run.elapsed_time_since_first()
+                    avg_time = quiz_run.average_time_per_attempt()
+                    max_retry_time = 180  # 3 minutes in seconds
+                    remaining_time = max_retry_time - elapsed_time
+                    
+                    logger.info(f"[QUIZ_RETRY] Answer was incorrect. Elapsed: {elapsed_time:.1f}s, Avg per attempt: {avg_time:.1f}s, Remaining: {remaining_time:.1f}s, Attempts: {quiz_attempt.attempt_number}")
+                    
+                    # Smart retry: check if average time per attempt < remaining time
+                    if quiz_run.can_retry_smart(max_retry_time):
+                        logger.info(f"[QUIZ_RETRY] Smart retry enabled - avg time ({avg_time:.1f}s) < remaining time ({remaining_time:.1f}s). Attempting again...")
+                        # Loop continues to next attempt
+                        continue
+                    else:
+                        logger.error(f"[QUIZ_FAILED] Not enough time for retry. Avg time: {avg_time:.1f}s >= Remaining: {remaining_time:.1f}s after {quiz_attempt.attempt_number} attempts.")
+                        quiz_chain.append({
+                            "quiz_url": current_url,
+                            "quiz_run": quiz_run.to_dict(),
+                            "failed": True,
+                            "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
+                        })
+                        break
+            
+            # Check if we should continue to next quiz
+            if is_correct and "url" in response_data and response_data["url"]:
+                current_url = response_data["url"]
+                continue
             else:
-                # Answer was incorrect, check if we can retry
-                elapsed_time = quiz_run.elapsed_time_since_first()
-                avg_time = quiz_run.average_time_per_attempt()
-                max_retry_time = 180  # 3 minutes in seconds
-                remaining_time = max_retry_time - elapsed_time
-                
-                logger.info(f"[QUIZ_RETRY] Answer was incorrect. Elapsed: {elapsed_time:.1f}s, Avg per attempt: {avg_time:.1f}s, Remaining: {remaining_time:.1f}s, Attempts: {quiz_attempt.attempt_number}")
-                
-                # Smart retry: check if average time per attempt < remaining time
-                if quiz_run.can_retry_smart(max_retry_time):
-                    logger.info(f"[QUIZ_RETRY] Smart retry enabled - avg time ({avg_time:.1f}s) < remaining time ({remaining_time:.1f}s). Attempting again...")
-                    # Loop continues to next attempt
-                    continue
-                else:
-                    logger.error(f"[QUIZ_FAILED] Not enough time for retry. Avg time: {avg_time:.1f}s >= Remaining: {remaining_time:.1f}s after {quiz_attempt.attempt_number} attempts.")
-                    quiz_chain.append({
-                        "quiz_url": current_url,
-                        "quiz_run": quiz_run.to_dict(),
-                        "failed": True,
-                        "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
-                    })
-                    break
+                break
         
         logger.info(f"[PIPELINE_COMPLETE] Quiz chain complete. Solved {len(quiz_chain)} quizzes")
         
