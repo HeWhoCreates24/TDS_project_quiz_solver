@@ -27,10 +27,18 @@ async def generate_next_tasks(plan_obj: Dict[str, Any], artifacts: Dict[str, Any
     latest_image = None  # Track latest processed image
     latest_api_response = None  # Track latest API response
     
+    # FIRST PASS: Find best transcription (prioritize successful ones)
     for key, value in artifacts.items():
-        # Extract transcription early for reuse (audio instructions)
         if 'transcribe' in key.lower() and isinstance(value, dict):
-            transcription_text = value.get('text', '')
+            text = value.get('text', '')
+            # Only use transcriptions with actual content (>20 chars, not error messages)
+            if text and len(text) > 20 and "sorry" not in text.lower() and "cannot" not in text.lower():
+                transcription_text = text
+                logger.info(f"[TRANSCRIPTION_CACHE] Using successful transcription from {key}: {text[:100]}")
+                break  # Use first successful one
+    
+    for key, value in artifacts.items():
+        # Transcription already extracted in first pass
         
         # Track ALL operation types (generalized for multimodal)
         if isinstance(value, dict):
@@ -265,7 +273,7 @@ Your reasoning should be brief. Focus on CALLING TOOLS, not explaining.
     # This prevents the LLM from saying "no tasks needed" when calculations are still required
     force_tool_usage = has_dataframe and not has_statistics and transcription_text
     tool_choice_param = "required" if force_tool_usage else "auto"
-    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (forced={force_tool_usage})")
+    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (force_reason: df={has_dataframe}, no_stats={not has_statistics}, has_instructions={bool(transcription_text)})")
 
     OPEN_AI_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
     API_KEY = os.getenv("API_KEY")

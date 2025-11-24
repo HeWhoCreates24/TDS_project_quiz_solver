@@ -8,6 +8,7 @@ import base64
 import io
 import zipfile
 import logging
+import threading
 from typing import Any, Dict, List
 from tempfile import NamedTemporaryFile
 from playwright.async_api import async_playwright
@@ -17,8 +18,9 @@ import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
 
-# Global registry for dataframes
+# Global registry for dataframes with thread-safe lock
 dataframe_registry = {}
+_dataframe_lock = threading.Lock()
 
 
 def get_secret():
@@ -141,9 +143,13 @@ def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
         else:
             df = pd.read_csv(source, header=None)
         
-        dataframe_registry[f"df_{len(dataframe_registry)}"] = df
+        # Thread-safe registry write
+        with _dataframe_lock:
+            df_key = f"df_{len(dataframe_registry)}"
+            dataframe_registry[df_key] = df
+        
         return {
-            "dataframe_key": f"df_{len(dataframe_registry)-1}",
+            "dataframe_key": df_key,
             "shape": df.shape,
             "columns": list(df.columns),
             "sample": df.head().to_dict()
@@ -157,9 +163,14 @@ def parse_excel(path: str) -> Dict[str, Any]:
     """Parse Excel file"""
     try:
         df = pd.read_excel(path)
-        dataframe_registry[f"df_{len(dataframe_registry)}"] = df
+        
+        # Thread-safe registry write
+        with _dataframe_lock:
+            df_key = f"df_{len(dataframe_registry)}"
+            dataframe_registry[df_key] = df
+        
         return {
-            "dataframe_key": f"df_{len(dataframe_registry)-1}",
+            "dataframe_key": df_key,
             "shape": df.shape,
             "columns": list(df.columns),
             "sample": df.head().to_dict()
@@ -185,12 +196,16 @@ def parse_html_tables(html_content: str) -> Dict[str, Any]:
     try:
         tables = pd.read_html(html_content)
         result = {}
-        for i, table in enumerate(tables):
-            dataframe_registry[f"df_{len(dataframe_registry)}"] = table
-            result[f"table_{i}"] = {
-                "dataframe_key": f"df_{len(dataframe_registry)-1}",
-                "shape": table.shape
-            }
+        
+        # Thread-safe registry writes
+        with _dataframe_lock:
+            for i, table in enumerate(tables):
+                df_key = f"df_{len(dataframe_registry)}"
+                dataframe_registry[df_key] = table
+                result[f"table_{i}"] = {
+                    "dataframe_key": df_key,
+                    "shape": table.shape
+                }
         return {"tables": result}
     except Exception as e:
         logger.error(f"Error parsing HTML tables: {e}")
@@ -211,12 +226,15 @@ def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
 
 
 def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Perform DataFrame operations"""
+    """Perform DataFrame operations (thread-safe)"""
     df_key = params.get("dataframe_key")
-    if df_key not in dataframe_registry:
-        raise ValueError(f"DataFrame {df_key} not found in registry")
     
-    df = dataframe_registry[df_key]
+    # Thread-safe registry read - copy to avoid race conditions during filtering
+    with _dataframe_lock:
+        if df_key not in dataframe_registry:
+            raise ValueError(f"DataFrame {df_key} not found in registry")
+        df = dataframe_registry[df_key].copy()
+    
     result = None
     
     if op == "select":
@@ -329,8 +347,10 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError(f"Unknown operation: {op}")
     
     if isinstance(result, pd.DataFrame):
-        new_key = f"df_{len(dataframe_registry)}"
-        dataframe_registry[new_key] = result
+        # Thread-safe registry write
+        with _dataframe_lock:
+            new_key = f"df_{len(dataframe_registry)}"
+            dataframe_registry[new_key] = result
         return {
             "dataframe_key": new_key,
             "result": "DataFrame operation completed",
