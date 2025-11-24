@@ -24,6 +24,7 @@ from task_generator import generate_next_tasks
 from models import QuizAttempt, QuizRun
 from tools import ToolRegistry, ScrapingTools, CleansingTools, ProcessingTools, AnalysisTools, VisualizationTools
 from parallel_executor import build_dependency_graph
+from cache_manager import quiz_cache
 
 load_dotenv()
 
@@ -818,6 +819,9 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
                             "quiz_url": current_url,
                             "quiz_run": quiz_run.to_dict()
                         })
+                        
+                        # Log cache statistics
+                        quiz_cache.log_stats()
                         break
                 else:
                     # Answer was incorrect, check if we can retry
@@ -852,6 +856,9 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
                 break
         
         logger.info(f"[PIPELINE_COMPLETE] Quiz chain complete. Solved {len(quiz_chain)} quizzes")
+        
+        # Log final cache statistics
+        quiz_cache.log_stats()
         
         return {
             "success": True,

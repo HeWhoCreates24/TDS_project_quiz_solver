@@ -11,6 +11,7 @@ import logging
 import httpx
 from playwright.async_api import async_playwright
 import asyncio
+from cache_manager import quiz_cache, hash_file
 
 logger = logging.getLogger(__name__)
 
@@ -799,6 +800,21 @@ class MultimediaTools:
         try:
             import os
             
+            # Hash audio file for caching (permanent - audio content is immutable)
+            try:
+                audio_hash = hash_file(audio_path)
+                cached = quiz_cache.get_transcription(audio_hash, ttl=None)
+                if cached:
+                    quiz_cache.record_time_saved(5.0)  # Transcription typically takes ~5s
+                    logger.info(f"[CACHE_HIT] Transcription for {audio_path}: {cached.get('text', '')[:50]}...")
+                    return cached
+                
+                # Cache miss
+                quiz_cache.record_miss()
+            except Exception as hash_error:
+                logger.warning(f"Could not hash audio file for caching: {hash_error}")
+                audio_hash = None
+            
             # Since OpenRouter doesn't support audio transcription, try using speech_recognition
             try:
                 import speech_recognition as sr
@@ -847,12 +863,18 @@ class MultimediaTools:
                 except:
                     pass
                 
-                return {
+                result = {
                     "text": text,
                     "success": True,
                     "audio_path": audio_path,
                     "method": "speech_recognition"
                 }
+                
+                # Cache the result (permanent - audio content doesn't change)
+                if audio_hash:
+                    quiz_cache.set_transcription(audio_hash, result, ttl=None)
+                
+                return result
             except ImportError:
                 logger.error("[TRANSCRIBE] speech_recognition or pydub not installed")
                 # Return error with suggestion

@@ -15,6 +15,7 @@ from playwright.async_api import async_playwright
 import httpx
 import pandas as pd
 import matplotlib.pyplot as plt
+from cache_manager import quiz_cache, hash_content
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,16 @@ def extract_json_from_markdown(text: str) -> str:
 
 async def render_page(url: str) -> Dict[str, Any]:
     """Render page with Playwright and extract content"""
+    # Check cache first (5 min TTL for dynamic content)
+    cached = quiz_cache.get_rendered_page(url, ttl=300)
+    if cached:
+        quiz_cache.record_time_saved(3.0)  # Rendering typically takes ~3s
+        return cached
+    
+    # Cache miss - render page
+    quiz_cache.record_miss()
+    start_time = __import__('time').time()
+    
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         page = await browser.new_page()
@@ -71,7 +82,8 @@ async def render_page(url: str) -> Dict[str, Any]:
         rendered_divs = await page.eval_on_selector_all("div[id]", "els => els.map(e => ({id: e.id, text: e.innerText, html: e.innerHTML}))")
         
         await browser.close()
-        return {
+        
+        result = {
             "html": content,
             "text": text,
             "links": links,
@@ -81,6 +93,10 @@ async def render_page(url: str) -> Dict[str, Any]:
             "video_sources": video_sources,
             "image_sources": image_sources
         }
+        
+        # Cache the result
+        quiz_cache.set_rendered_page(url, result, ttl=300)
+        return result
 
 
 async def fetch_text(url: str) -> Dict[str, Any]:
@@ -97,6 +113,15 @@ async def fetch_text(url: str) -> Dict[str, Any]:
 
 async def download_file(url: str) -> Dict[str, Any]:
     """Download file and return metadata"""
+    # Check cache first (1 hour TTL)
+    cached = quiz_cache.get_file(url, ttl=3600)
+    if cached:
+        quiz_cache.record_time_saved(2.0)  # Downloads typically take ~2s
+        return cached
+    
+    # Cache miss - download file
+    quiz_cache.record_miss()
+    
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=60.0)
@@ -107,11 +132,15 @@ async def download_file(url: str) -> Dict[str, Any]:
                 tmp.write(response.content)
                 path = tmp.name
             
-            return {
+            result = {
                 "path": path,
                 "size": len(response.content),
                 "content_type": response.headers.get("content-type")
             }
+            
+            # Cache the result
+            quiz_cache.set_file(url, result, ttl=3600)
+            return result
     except Exception as e:
         logger.error(f"Error downloading file from {url}: {e}")
         raise
@@ -124,6 +153,10 @@ def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
         source = url if url else path
         if not source:
             raise ValueError("Either path or url must be provided")
+        
+        # Cache miss - parse CSV (we'll optimize caching later)
+        # For now, skip caching parse_csv to avoid dataframe registry issues
+        quiz_cache.record_miss()
         
         # Try reading first to detect if it has headers
         # Read a sample to check if first row looks like data or headers
@@ -148,12 +181,15 @@ def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
             df_key = f"df_{len(dataframe_registry)}"
             dataframe_registry[df_key] = df
         
-        return {
+        result = {
             "dataframe_key": df_key,
             "shape": df.shape,
             "columns": list(df.columns),
             "sample": df.head().to_dict()
         }
+        
+        # Skip caching for now (dataframe registry restoration is complex)
+        return result
     except Exception as e:
         logger.error(f"Error parsing CSV from {source}: {e}")
         raise
