@@ -17,9 +17,11 @@ dependencies = [
     "playwright>=1.55.0",
     "plotly>=6.4.0",
     "pydantic[email]>=2.12.4",
+    "pydub>=0.25.1",
     "pypdf2>=3.0.1",
     "python-dotenv>=1.2.1",
     "scikit-learn>=1.7.2",
     "seaborn>=0.13.2",
+    "speechrecognition>=3.14.4",
     "uvicorn>=0.38.0",
 ]

@@ -109,7 +109,13 @@ async def download_file(url: str) -> Dict[str, Any]:
             response = await client.get(url, timeout=60)
             response.raise_for_status()
             
-            with NamedTemporaryFile(delete=False, suffix=".download") as tmp_file:
+            # Preserve original file extension
+            import os
+            filename = url.split("/")[-1].split("?")[0]  # Remove query params
+            _, ext = os.path.splitext(filename)
+            suffix = ext if ext else ".download"
+            
+            with NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
                 tmp_file.write(response.content)
                 tmp_path = tmp_file.name
             
@@ -117,7 +123,7 @@ async def download_file(url: str) -> Dict[str, Any]:
                 "path": tmp_path,
                 "content_type": response.headers.get("content-type", "unknown"),
                 "size": len(response.content),
-                "filename": url.split("/")[-1]
+                "filename": filename
             }
     except Exception as e:
         logger.error(f"Error downloading file from {url}: {e}")
@@ -131,7 +137,29 @@ def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
         if not source:
             raise ValueError("Either 'path' or 'url' must be provided")
         
-        df = pd.read_csv(source)
+        # Try reading first to detect if it has headers
+        # Read a sample to check if first row looks like data or headers
+        sample_df = pd.read_csv(source, nrows=5)
+        
+        # Heuristic: If the first row (column names) are all numeric, likely no header
+        has_header = True
+        try:
+            # If all column names can be converted to numbers, it's likely data not headers
+            all_numeric = all(str(col).replace('.', '').replace('-', '').isdigit() for col in sample_df.columns)
+            if all_numeric:
+                has_header = False
+                logger.info(f"[PARSE_CSV] Detected no header - first row appears to be numeric data")
+        except:
+            pass
+        
+        # Read the full CSV with appropriate header setting
+        if has_header:
+            df = pd.read_csv(source)
+        else:
+            df = pd.read_csv(source, header=None)
+            # Give default column names like 'column_0', 'column_1', etc.
+            df.columns = [f'column_{i}' for i in range(len(df.columns))]
+        
         dataframe_registry[f"df_{len(dataframe_registry)}"] = df
         return {
             "dataframe_key": f"df_{len(dataframe_registry)-1}",
@@ -200,49 +228,102 @@ def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
 
 def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """Perform DataFrame operations"""
-    try:
-        df_key = params.get("dataframe_key")
-        if df_key not in dataframe_registry:
-            raise ValueError(f"DataFrame {df_key} not found in registry")
-        
-        df = dataframe_registry[df_key]
-        result = None
-        
-        if op == "select":
-            columns = params.get("columns", [])
-            result = df[columns] if columns else df
-        elif op == "filter":
-            condition = params.get("condition")
-            result = df.query(condition) if condition else df
-        elif op == "sum":
-            column = params.get("column")
-            result = df[column].sum() if column else df.sum()
-        elif op == "mean":
-            column = params.get("column")
-            result = df[column].mean() if column else df.mean()
-        elif op == "groupby":
-            by = params.get("by")
-            agg = params.get("aggregation", "count")
-            result = df.groupby(by).agg(agg)
-        elif op == "count":
-            result = len(df)
-        else:
-            raise ValueError(f"Unknown operation: {op}")
-        
-        if isinstance(result, pd.DataFrame):
-            new_key = f"df_{len(dataframe_registry)}"
-            dataframe_registry[new_key] = result
-            return {
-                "dataframe_key": new_key,
-                "result": "DataFrame operation completed",
-                "shape": result.shape
-            }
-        else:
-            return {"result": result, "type": type(result).__name__}
+    df_key = params.get("dataframe_key")
+    if df_key not in dataframe_registry:
+        raise ValueError(f"DataFrame {df_key} not found in registry")
+    
+    df = dataframe_registry[df_key]
+    result = None
+    
+    if op == "select":
+        columns = params.get("columns", [])
+        result = df[columns] if columns else df
+    elif op == "filter":
+        condition = params.get("condition")
+        if condition:
+            # Parse condition to add backticks around column names if needed
+            import re
+            # Find column names (words before operators)
+            parts = re.split(r'(\s*[<>=!]+\s*)', condition)
+            if len(parts) >= 1:
+                col_name = parts[0].strip()
+                # Check if column name is numeric or needs backticks
+                if col_name.isdigit() or not col_name.isidentifier():
+                    condition = f"`{col_name}`" + ''.join(parts[1:])
             
-    except Exception as e:
-        logger.error(f"Error in dataframe operation {op}: {e}")
-        raise
+            logger.info(f"[FILTER] Original condition: {params.get('condition')}, Modified: {condition}")
+            logger.info(f"[FILTER] DataFrame shape before: {df.shape}, columns: {df.columns.tolist()}")
+            
+            # Try query first
+            try:
+                result = df.query(condition)
+                logger.info(f"[FILTER] Query succeeded. Shape after: {result.shape}")
+            except Exception as e:
+                logger.warning(f"[FILTER] Query failed with error: {e}")
+                # Fallback to boolean indexing
+                try:
+                    # Last resort: use boolean indexing
+                    logger.warning(f"[FILTER] query() failed, using boolean indexing for: {condition}")
+                    # Parse simple conditions like "column >= value"
+                    match = re.match(r'([^\s<>=!]+)\s*([<>=!]+)\s*(.+)', condition)
+                    if match:
+                        col, op_str, val = match.groups()
+                        col = col.strip()
+                        val = val.strip()
+                        
+                        # Convert value to appropriate type
+                        try:
+                            val = float(val) if '.' in val else int(val)
+                        except:
+                            pass
+                        
+                        # Apply boolean indexing
+                        if op_str == '>=':
+                            result = df[df[col] >= val]
+                        elif op_str == '>':
+                            result = df[df[col] > val]
+                        elif op_str == '<=':
+                            result = df[df[col] <= val]
+                        elif op_str == '<':
+                            result = df[df[col] < val]
+                        elif op_str == '==':
+                            result = df[df[col] == val]
+                        elif op_str == '!=':
+                            result = df[df[col] != val]
+                        else:
+                            raise ValueError(f"Unknown operator: {op_str}")
+                    else:
+                        raise ValueError(f"Could not parse filter condition: {condition}")
+                except Exception:
+                    # If fallback parsing/indexing fails, let the original exception propagate
+                    raise
+        else:
+            result = df
+    elif op == "sum":
+        column = params.get("column")
+        result = df[column].sum() if column else df.sum()
+    elif op == "mean":
+        column = params.get("column")
+        result = df[column].mean() if column else df.mean()
+    elif op == "groupby":
+        by = params.get("by")
+        agg = params.get("aggregation", "count")
+        result = df.groupby(by).agg(agg)
+    elif op == "count":
+        result = len(df)
+    else:
+        raise ValueError(f"Unknown operation: {op}")
+    
+    if isinstance(result, pd.DataFrame):
+        new_key = f"df_{len(dataframe_registry)}"
+        dataframe_registry[new_key] = result
+        return {
+            "dataframe_key": new_key,
+            "result": "DataFrame operation completed",
+            "shape": result.shape
+        }
+    else:
+        return {"result": result, "type": type(result).__name__}
 
 def make_plot(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Create plot and return base64 data URI"""
@@ -419,15 +500,17 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         "method": {
                             "type": "string",
                             "enum": ["GET", "POST", "PUT", "DELETE"],
-                            "description": "HTTP method"
+                            "description": "HTTP method (default: GET)"
                         },
                         "headers": {
                             "type": "object",
-                            "description": "Optional custom headers"
+                            "description": "Custom headers as key-value pairs",
+                            "additionalProperties": {"type": "string"}
                         },
                         "body": {
                             "type": "object",
-                            "description": "Optional request body for POST/PUT"
+                            "description": "Request body for POST/PUT as JSON object",
+                            "additionalProperties": True
                         }
                     },
                     "required": ["url"]
@@ -590,7 +673,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                     "properties": {
                         "dataframe": {
                             "type": "string",
-                            "description": "DataFrame key from registry"
+                            "description": "DataFrame key from registry (e.g., 'df_0')"
                         },
                         "operation": {
                             "type": "string",
@@ -599,7 +682,21 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         },
                         "params": {
                             "type": "object",
-                            "description": "Operation-specific parameters"
+                            "description": "Operation-specific parameters",
+                            "properties": {
+                                "index": {
+                                    "type": "string",
+                                    "description": "For pivot: column to use as index"
+                                },
+                                "columns": {
+                                    "type": "string",
+                                    "description": "For pivot: column to use as columns"
+                                },
+                                "values": {
+                                    "type": "string",
+                                    "description": "For pivot: column to use as values"
+                                }
+                            }
                         }
                     },
                     "required": ["dataframe", "operation"]
@@ -650,68 +747,36 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "dataframe_ops",
-                "description": "Perform operations on pandas DataFrames such as filter, aggregate, transform, etc.",
+                "description": "Perform operations on DataFrames: filter rows, calculate sums/means, select columns, etc.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "op": {
                             "type": "string",
-                            "description": "Operation to perform (e.g., 'filter', 'aggregate', 'groupby', 'sort', 'select')",
-                            "enum": ["filter", "aggregate", "groupby", "sort", "select", "transform", "count"]
+                            "description": "Operation type",
+                            "enum": ["filter", "sum", "mean", "count", "select", "groupby"]
                         },
                         "params": {
                             "type": "object",
-                            "description": "Parameters for the operation including dataframe reference and operation-specific arguments"
+                            "description": "Operation parameters",
+                            "properties": {
+                                "dataframe_key": {
+                                    "type": "string",
+                                    "description": "DataFrame to operate on (e.g., 'df_0')"
+                                },
+                                "condition": {
+                                    "type": "string",
+                                    "description": "For filter: COMPLETE condition string with column name, operator, and value (e.g., '96903 >= 1371' or 'temperature > 25'). MUST include the full comparison value."
+                                },
+                                "column": {
+                                    "type": "string",
+                                    "description": "For sum/mean: column name to aggregate"
+                                }
+                            },
+                            "required": ["dataframe_key"]
                         }
                     },
                     "required": ["op", "params"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "filter_data",
-                "description": "Filter DataFrame rows based on conditions",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry"
-                        },
-                        "filters": {
-                            "type": "object",
-                            "description": "Filter conditions (column: value pairs or expressions)"
-                        }
-                    },
-                    "required": ["dataframe", "filters"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "sort_data",
-                "description": "Sort DataFrame by one or more columns",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry"
-                        },
-                        "sort_by": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Column names to sort by"
-                        },
-                        "ascending": {
-                            "type": "boolean",
-                            "description": "Sort in ascending order"
-                        }
-                    },
-                    "required": ["dataframe", "sort_by"]
                 }
             }
         },
@@ -753,7 +818,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                     "properties": {
                         "dataframe": {
                             "type": "string",
-                            "description": "DataFrame key from registry"
+                            "description": "DataFrame key from registry (e.g., 'df_0')"
                         },
                         "model_type": {
                             "type": "string",
@@ -762,7 +827,22 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         },
                         "kwargs": {
                             "type": "object",
-                            "description": "Model-specific parameters"
+                            "description": "Model parameters",
+                            "properties": {
+                                "target_column": {
+                                    "type": "string",
+                                    "description": "Target/y column for supervised learning"
+                                },
+                                "feature_columns": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Feature/X columns"
+                                },
+                                "n_clusters": {
+                                    "type": "integer",
+                                    "description": "Number of clusters for kmeans"
+                                }
+                            }
                         }
                     },
                     "required": ["dataframe", "model_type"]
@@ -779,7 +859,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                     "properties": {
                         "dataframe": {
                             "type": "string",
-                            "description": "DataFrame key with geospatial data"
+                            "description": "DataFrame key with geospatial data (e.g., 'df_0')"
                         },
                         "analysis_type": {
                             "type": "string",
@@ -788,7 +868,21 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         },
                         "kwargs": {
                             "type": "object",
-                            "description": "Analysis-specific parameters"
+                            "description": "Analysis parameters",
+                            "properties": {
+                                "lat_col": {
+                                    "type": "string",
+                                    "description": "Latitude column name"
+                                },
+                                "lon_col": {
+                                    "type": "string",
+                                    "description": "Longitude column name"
+                                },
+                                "address_col": {
+                                    "type": "string",
+                                    "description": "Address column for geocoding"
+                                }
+                            }
                         }
                     },
                     "required": ["analysis_type"]
@@ -878,11 +972,18 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                     "properties": {
                         "dataframe": {
                             "type": "string",
-                            "description": "DataFrame key from registry"
+                            "description": "DataFrame key from registry (e.g., 'df_0')"
                         },
                         "summary_stats": {
                             "type": "object",
-                            "description": "Summary statistics to include in narrative"
+                            "description": "Summary statistics to include",
+                            "properties": {
+                                "mean": {"type": "number"},
+                                "median": {"type": "number"},
+                                "std": {"type": "number"},
+                                "count": {"type": "integer"}
+                            },
+                            "additionalProperties": True
                         }
                     },
                     "required": ["dataframe"]
@@ -980,7 +1081,25 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                     "properties": {
                         "spec": {
                             "type": "object",
-                            "description": "Plot specification including type, data, styling"
+                            "description": "Plot specification",
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "description": "Plot type (line, bar, scatter, etc.)"
+                                },
+                                "data": {
+                                    "type": "object",
+                                    "description": "Data source",
+                                    "properties": {
+                                        "dataframe_key": {"type": "string"},
+                                        "x": {"type": "string", "description": "X column"},
+                                        "y": {"type": "string", "description": "Y column"}
+                                    }
+                                },
+                                "title": {"type": "string"},
+                                "output_path": {"type": "string"}
+                            },
+                            "required": ["type", "data"]
                         }
                     },
                     "required": ["spec"]
@@ -1230,6 +1349,10 @@ Remember: Call ALL tools needed in ONE response. We can execute multiple tools i
                         logger.error(f"[LLM_TOOL_{i+1}] Skipping tool call {func_name}")
                         continue
                 
+                # Clean URL arguments - remove trailing punctuation
+                if "url" in func_args and isinstance(func_args["url"], str):
+                    func_args["url"] = func_args["url"].rstrip('.,;:"\' ')
+                
                 logger.info(f"[LLM_TOOL_{i+1}] {func_name} with args: {func_args}")
                 
                 tasks.append({
@@ -1452,55 +1575,130 @@ async def generate_next_tasks(plan_obj: Dict[str, Any], artifacts: Dict[str, Any
         if isinstance(value, str):
             artifacts_summary[key] = value[:200] if len(value) > 200 else value
         elif isinstance(value, dict):
-            artifacts_summary[key] = {k: str(v)[:100] for k, v in list(value.items())[:5]}
+            # Don't truncate transcription text - it contains critical instructions
+            if 'transcribe' in key.lower() and 'text' in value:
+                artifacts_summary[key] = {k: v if k == 'text' else str(v)[:100] for k, v in list(value.items())[:10]}
+            else:
+                artifacts_summary[key] = {k: str(v)[:100] for k, v in list(value.items())[:5]}
         else:
             artifacts_summary[key] = str(value)[:200]
     
-    system_prompt = """You are planning the NEXT steps to complete a quiz task.
+    # CRITICAL CHECK: If we have audio but no transcription, force it
+    has_audio_file = any('content_type' in str(v) and 'audio' in str(v).lower() for v in artifacts.values())
+    has_transcription = any('transcribe' in k.lower() for k in artifacts.keys())
     
-You have already executed some tasks and produced artifacts. Now determine what additional steps are needed.
+    if has_audio_file and not has_transcription:
+        # Find the audio file path
+        audio_path = None
+        for key, value in artifacts.items():
+            if isinstance(value, dict) and value.get('content_type', '').startswith('audio'):
+                audio_path = value.get('path')
+                break
+        
+        if audio_path:
+            logger.info(f"[FORCE_TRANSCRIBE] Audio file found but not transcribed. Forcing transcribe_audio with path: {audio_path}")
+            return [{
+                "id": f"forced_transcribe_{len(artifacts)}",
+                "tool_name": "transcribe_audio",
+                "inputs": {"audio_path": audio_path},
+                "produces": [{"key": f"transcribe_audio_result_{len(artifacts)}", "type": "json"}],
+                "notes": "Forced transcription of audio file"
+            }]
+    
+    # CRITICAL CHECK: If we have transcription mentioning CSV but no dataframe, force parse_csv
+    has_dataframe = any('dataframe_key' in str(v) for v in artifacts.values())
+    transcription_mentions_csv = False
+    transcription_text = None
+    
+    for key, value in artifacts.items():
+        if 'transcribe' in key.lower() and isinstance(value, dict):
+            transcription_text = value.get('text', '').lower()
+            if 'csv' in transcription_text or 'data' in transcription_text or 'file' in transcription_text:
+                transcription_mentions_csv = True
+            break
+    
+    if has_transcription and transcription_mentions_csv and not has_dataframe:
+        # Find CSV link in page
+        csv_link = None
+        for link in page_data.get('links', []):
+            if isinstance(link, str) and '.csv' in link.lower():
+                csv_link = link
+                break
+        
+        if csv_link:
+            logger.info(f"[FORCE_PARSE_CSV] Transcription mentions CSV but no dataframe found. Forcing parse_csv for {csv_link}")
+            return [{
+                "id": f"forced_parse_csv_{len(artifacts)}",
+                "tool_name": "parse_csv",
+                "inputs": {"url": csv_link},
+                "produces": [{"key": f"parse_csv_result_{len(artifacts)}", "type": "json"}],
+                "notes": "Forced CSV parsing based on transcription"
+            }]
+    
 
-CRITICAL: Use function calling to specify the exact tools needed. Common patterns:
+    system_prompt = """You are a task planner that MUST use function calling to specify next steps.
 
-1. If you have downloaded an AUDIO file (content_type: audio/*):
-   - MUST call transcribe_audio to convert speech to text
-   - The transcribed text will contain instructions for what to do next
-   
-2. If you have transcribed audio text + CSV data:
-   - Follow the instructions in the transcribed text
-   - Use calculate_statistics or dataframe_ops based on what the audio says
+IMPORTANT CONSTRAINTS:
+- You MUST call tools using function calling - do NOT respond with text explanations
+- Keep reasoning minimal - just enough to track what you're doing
+- Focus on ACTION, not explanation
 
-3. If you have dataframe metadata but need to analyze it (sum, count, filter):
-   - Call calculate_statistics or dataframe_ops on the dataframe
-   
-4. If you have HTML/text but need to extract specific information:
-   - Call call_llm with a prompt to extract the needed information
+Understanding multi-step workflows:
+- When instructions mention filtering/selecting a subset of data, you must FIRST filter the data (creates new dataframe), THEN perform calculations on the filtered result
+- Example: "sum values >= 100" requires TWO steps:
+  1. dataframe_ops(op="filter", params={"dataframe_key": "df_0", "condition": "column >= 100"}) → creates df_1
+  2. calculate_statistics(dataframe="df_1", stats=["sum"]) → calculates sum on filtered data
+- Do NOT calculate statistics on the original dataframe if filtering is required
 
-5. If you need more data from URLs:
-   - Call render_js_page or fetch_text
+Tool chaining:
+- parse_csv → returns dataframe_key (e.g., "df_0")
+- dataframe_ops with filter → returns NEW dataframe_key (e.g., "df_1")  
+- calculate_statistics → uses the appropriate dataframe_key (filtered or original)"""
 
-Use the dataframe_key from parse_csv results to operate on the actual data."""
-
+    # Extract transcription text if available for better prompting
+    transcription_text = None
+    for key, value in artifacts.items():
+        if 'transcribe' in key.lower() and isinstance(value, dict):
+            transcription_text = value.get('text', '')
+            break
+    
+    # Check what we have and what we're missing
+    has_statistics = any('statistics' in str(v) for v in artifacts.values())
+    has_dataframe = any('dataframe_key' in str(v) for v in artifacts.values())
+    
     prompt = f"""
-CURRENT STATE:
-Artifacts produced so far: {json.dumps(artifacts_summary, indent=2)}
+STATE:
+Artifacts: {json.dumps(artifacts_summary, indent=2)}
 
-Analysis: {json.dumps(completion_status, indent=2)}
+Page text: {page_data.get('text', 'N/A')[:500]}
+Links: {page_data.get('links', [])}
 
-Quiz page text: {page_data.get('text', 'N/A')[:500]}
-Quiz page links: {page_data.get('links', [])}
-Quiz page audio sources: {page_data.get('audio_sources', [])}
+{f'''INSTRUCTIONS FROM AUDIO/TEXT:
+"{transcription_text}"
 
-TASK: What additional tool calls are needed to get the final answer?
+Available tools for data operations:
+- dataframe_ops(op="filter", params={{"dataframe_key": "df_X", "condition": "column >= value"}})
+- calculate_statistics(dataframe="df_X", stats=["sum", "mean", "median", "count", etc.])
 
-IMPORTANT CHECKS:
-1. Do you see a downloaded audio file (with "path" and "content_type": "audio/...")? → Call transcribe_audio on that path
-2. Do you see transcribed audio text? → Read it to determine what analysis to perform
-3. Do you see a CSV link in the page? → Call parse_csv to load it
-4. Do you see dataframe metadata with a 'dataframe_key'? → Call calculate_statistics to analyze it based on the instructions
+Current state: Transcription ✓, Data {"✓" if has_dataframe else "✗"}, Calculations {"✓" if has_statistics else "✗"}
+''' if transcription_text else ''}
 
-The final answer is NOT file metadata - it's the result of analyzing data based on audio instructions.
+TASK: Based on the instructions above, call the necessary tools to complete the task.
+Use function calling - do NOT write text explanations.
+
+Your reasoning should be brief. Focus on CALLING TOOLS, not explaining.
 """
+
+    logger.info(f"[GENERATE_NEXT_TASKS] Transcription text: {transcription_text}")
+    logger.info(f"[GENERATE_NEXT_TASKS] Artifacts summary keys: {list(artifacts_summary.keys())}")
+    logger.info(f"[GENERATE_NEXT_TASKS] Has statistics: {has_statistics}, Has dataframe: {has_dataframe}")
+    logger.info(f"[GENERATE_NEXT_TASKS] Full prompt sent to LLM:\n{prompt}")
+
+    # Force tool usage if we have data but no calculations yet
+    # This prevents the LLM from saying "no tasks needed" when calculations are still required
+    force_tool_usage = has_dataframe and not has_statistics and transcription_text
+    tool_choice_param = "required" if force_tool_usage else "auto"
+    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (forced={force_tool_usage})")
 
     OPEN_AI_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
     API_KEY = os.getenv("API_KEY")
@@ -1519,7 +1717,7 @@ The final answer is NOT file metadata - it's the result of analyzing data based 
             {"role": "user", "content": prompt},
         ],
         "tools": tools,
-        "tool_choice": "auto",
+        "tool_choice": tool_choice_param,
         "temperature": 0,
         "max_tokens": 2000,
     }
@@ -1531,6 +1729,7 @@ The final answer is NOT file metadata - it's the result of analyzing data based 
             data = response.json()
             
             message = data["choices"][0]["message"]
+            logger.info(f"[GENERATE_NEXT_TASKS] LLM response message: {message}")
             
             # Check if model wants to call tools
             if message.get("tool_calls"):
@@ -1540,7 +1739,48 @@ The final answer is NOT file metadata - it's the result of analyzing data based 
                 next_tasks = []
                 for i, tool_call in enumerate(message["tool_calls"]):
                     func_name = tool_call["function"]["name"]
-                    func_args = json.loads(tool_call["function"]["arguments"])
+                    raw_args = tool_call["function"]["arguments"]
+                    
+                    # Clean up malformed JSON from o1 model (reasoning tokens leak into JSON)
+                    # Remove common garbage patterns like: }})```? or trailing junk
+                    cleaned_args = raw_args
+                    
+                    # Remove markdown code block markers
+                    cleaned_args = re.sub(r'```[a-z]*\??', '', cleaned_args)
+                    
+                    # Fix common patterns where closing braces are duplicated
+                    cleaned_args = re.sub(r'\}\}+\)', '}', cleaned_args)
+                    cleaned_args = re.sub(r'\}\}+', '}', cleaned_args)
+                    
+                    # Remove trailing question marks and other junk after closing braces
+                    cleaned_args = re.sub(r'\}[^\}]*$', '}', cleaned_args)
+                    
+                    try:
+                        func_args = json.loads(cleaned_args)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"[NEXT_TASK_{i+1}] Failed to parse arguments after cleanup: {e}")
+                        logger.error(f"[NEXT_TASK_{i+1}] Raw: {raw_args}")
+                        logger.error(f"[NEXT_TASK_{i+1}] Cleaned: {cleaned_args}")
+                        # Try original as last resort
+                        func_args = json.loads(raw_args)
+                    
+                    # Clean string values - remove trailing junk
+                    for key, value in func_args.items():
+                        if isinstance(value, str):
+                            # Remove common junk patterns from string values
+                            value = re.sub(r'\}\}+.*$', '', value)  # Remove }})... 
+                            value = re.sub(r'```.*$', '', value)     # Remove ```...
+                            value = value.rstrip('.,;:"\' ?')        # Remove trailing punctuation
+                            func_args[key] = value
+                    
+                    # Recursively clean nested dicts (like params)
+                    if "params" in func_args and isinstance(func_args["params"], dict):
+                        for key, value in func_args["params"].items():
+                            if isinstance(value, str):
+                                value = re.sub(r'\}\}+.*$', '', value)
+                                value = re.sub(r'```.*$', '', value)
+                                value = value.rstrip('.,;:"\' ?')
+                                func_args["params"][key] = value
                     
                     logger.info(f"[NEXT_TASK_{i+1}] {func_name} with args: {func_args}")
                     
@@ -1554,6 +1794,7 @@ The final answer is NOT file metadata - it's the result of analyzing data based 
                 
                 return next_tasks
             else:
+                logger.warning(f"[NEXT_TASKS] LLM did not call any tools despite tool_choice=required")
                 logger.info(f"[NEXT_TASKS] No additional tasks needed")
                 return []
                 
@@ -1893,26 +2134,35 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                 candidate_artifacts[cleaned_key] = artifacts[cleaned_key]
         
         # If the specified artifact is not useful (HTML/script/dict), look for better alternatives
-        # Prioritize: extracted_*, rendered_*, scraped_*, secret_* artifacts that are meaningful
-        if not candidate_artifacts or all(isinstance(v, dict) or (isinstance(v, str) and ('<' in v or 'script' in v.lower())) for v in candidate_artifacts.values()):
+        # Prioritize: statistics results, then extracted_*, rendered_*, scraped_*, secret_* artifacts
+        if not candidate_artifacts or all(isinstance(v, dict) and 'statistics' not in v or (isinstance(v, str) and ('<' in v or 'script' in v.lower())) for v in candidate_artifacts.values()):
             logger.info("[ARTIFACT_SELECTION] Specified artifact not useful, searching for better alternatives...")
             
-            # Sort to check newest artifacts first (rendered_*/scraped_* typically created last)
+            # First check for statistics results (highest priority)
             for key in sorted(artifacts.keys(), reverse=True):
                 value = artifacts[key]
-                # Skip HTML, script tags, and dict objects
-                if isinstance(value, dict):
-                    continue
-                if isinstance(value, str) and ('<' in value or 'script' in value.lower()):
-                    continue
-                # Prefer ANY meaningful artifact (not just extracted/secret)
-                # This includes rendered_*, scraped_*, extracted_*, secret_*
-                if isinstance(value, str) and len(value) < 500 and len(value) > 2:
-                    prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_')
-                    if any(key.startswith(p) for p in prefixes):
-                        logger.info(f"[ARTIFACT_SELECTION] Found alternative: {key} = {value[:100]}")
-                        candidate_artifacts[key] = value
-                        break  # Take the first (newest) good alternative
+                if isinstance(value, dict) and 'statistics' in value:
+                    logger.info(f"[ARTIFACT_SELECTION] Found statistics result: {key}")
+                    candidate_artifacts[key] = value
+                    break
+            
+            # If no statistics found, look for string artifacts
+            if not candidate_artifacts:
+                for key in sorted(artifacts.keys(), reverse=True):
+                    value = artifacts[key]
+                    # Skip HTML, script tags, and dict objects (except statistics)
+                    if isinstance(value, dict):
+                        continue
+                    if isinstance(value, str) and ('<' in value or 'script' in value.lower()):
+                        continue
+                    # Prefer ANY meaningful artifact (not just extracted/secret)
+                    # This includes rendered_*, scraped_*, extracted_*, secret_*
+                    if isinstance(value, str) and len(value) < 500 and len(value) > 2:
+                        prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_')
+                        if any(key.startswith(p) for p in prefixes):
+                            logger.info(f"[ARTIFACT_SELECTION] Found alternative: {key} = {value[:100]}")
+                            candidate_artifacts[key] = value
+                            break  # Take the first (newest) good alternative
         
         # Select best artifact
         if candidate_artifacts:
@@ -2150,37 +2400,54 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
                 logger.info(f"[QUIZ_PLAN] Direct answer from LLM: {str(llm_response['content'])[:100]}")
                 plan_obj["final_answer_spec"]["from"] = str(llm_response["content"])
             
-            # FALLBACK: If LLM didn't call tools but there are links, force smart scraping
-            if not plan_obj["tasks"] and page_data.get("links"):
-                logger.warning(f"[QUIZ_PLAN] LLM did not call tools but page has {len(page_data['links'])} links. Forcing smart scraping.")
-                for i, link in enumerate(page_data['links'][:3]):  # Limit to first 3 links
-                    if link and link.startswith('http'):
-                        # Check file extension to choose appropriate tool
-                        link_lower = link.lower()
-                        if '.csv' in link_lower:
-                            tool_name = "parse_csv"
-                            result_key = f"csv_data_{i+1}"
-                            logger.info(f"[QUIZ_PLAN] Forcing CSV parse: {link}")
-                        elif '.xlsx' in link_lower or '.xls' in link_lower:
-                            tool_name = "parse_excel"
-                            result_key = f"excel_data_{i+1}"
-                            logger.info(f"[QUIZ_PLAN] Forcing Excel parse: {link}")
-                        elif '.json' in link_lower:
-                            tool_name = "parse_json_file"
-                            result_key = f"json_data_{i+1}"
-                            logger.info(f"[QUIZ_PLAN] Forcing JSON parse: {link}")
-                        else:
-                            tool_name = "render_js_page"
-                            result_key = f"scraped_content_{i+1}"
-                            logger.info(f"[QUIZ_PLAN] Forcing page render: {link}")
-                        
-                        plan_obj["tasks"].append({
-                            "id": f"forced_task_{i+1}",
-                            "tool_name": tool_name,
-                            "inputs": {"url": link} if tool_name == "parse_csv" else {"url": link} if tool_name == "render_js_page" else {"path": link},
-                            "produces": [{"key": result_key, "type": "json"}],
-                            "notes": f"Forced {tool_name} of link: {link}"
-                        })
+            # FALLBACK: If LLM didn't call tools but there are links or audio, force smart scraping
+            if not plan_obj["tasks"]:
+                # First check for audio files
+                if page_data.get("audio_sources"):
+                    logger.warning(f"[QUIZ_PLAN] LLM did not call tools but page has {len(page_data['audio_sources'])} audio sources. Forcing audio download.")
+                    for i, audio_url in enumerate(page_data['audio_sources'][:1]):  # Just first audio
+                        if audio_url and audio_url.startswith('http'):
+                            plan_obj["tasks"].append({
+                                "id": f"forced_audio_task_{i+1}",
+                                "tool_name": "download_file",
+                                "inputs": {"url": audio_url},
+                                "produces": [{"key": f"download_file_result_{i+1}", "type": "json"}],
+                                "notes": f"Forced download of audio: {audio_url}"
+                            })
+                            # Update final answer to reference this result
+                            plan_obj["final_answer_spec"]["from"] = f"download_file_result_{i+1}"
+                
+                # Then check for data file links
+                if not plan_obj["tasks"] and page_data.get("links"):
+                    logger.warning(f"[QUIZ_PLAN] LLM did not call tools but page has {len(page_data['links'])} links. Forcing smart scraping.")
+                    for i, link in enumerate(page_data['links'][:3]):  # Limit to first 3 links
+                        if link and link.startswith('http'):
+                            # Check file extension to choose appropriate tool
+                            link_lower = link.lower()
+                            if '.csv' in link_lower:
+                                tool_name = "parse_csv"
+                                result_key = f"csv_data_{i+1}"
+                                logger.info(f"[QUIZ_PLAN] Forcing CSV parse: {link}")
+                            elif '.xlsx' in link_lower or '.xls' in link_lower:
+                                tool_name = "parse_excel"
+                                result_key = f"excel_data_{i+1}"
+                                logger.info(f"[QUIZ_PLAN] Forcing Excel parse: {link}")
+                            elif '.json' in link_lower:
+                                tool_name = "parse_json_file"
+                                result_key = f"json_data_{i+1}"
+                                logger.info(f"[QUIZ_PLAN] Forcing JSON parse: {link}")
+                            else:
+                                tool_name = "render_js_page"
+                                result_key = f"scraped_content_{i+1}"
+                                logger.info(f"[QUIZ_PLAN] Forcing page render: {link}")
+                            
+                            plan_obj["tasks"].append({
+                                "id": f"forced_task_{i+1}",
+                                "tool_name": tool_name,
+                                "inputs": {"url": link} if tool_name == "parse_csv" else {"url": link} if tool_name == "render_js_page" else {"path": link},
+                                "produces": [{"key": result_key, "type": "json"}],
+                                "notes": f"Forced {tool_name} of link: {link}"
+                            })
                 
                 # Update final answer to reference last result
                 if plan_obj["tasks"]:
