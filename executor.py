@@ -82,7 +82,7 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             elif tool_name == "fetch_text":
                                 logger.info(f"[TOOL_EXEC] {task_id}: fetch_text - URL: {inputs['url']}")
                                 result = await fetch_text(inputs["url"])
-                                logger.info(f"[TOOL_RESULT] {task_id}: fetch_text - Text length: {len(result.get('text', ''))}")
+                                logger.info(f"[TOOL_RESULT] {task_id}: fetch_text - Text length: {len(result.get('content', ''))}")
                                 return (task, result)
                             elif tool_name == "render_js_page":
                                 logger.info(f"[TOOL_EXEC] {task_id}: render_js_page - URL: {inputs['url']}")
@@ -146,39 +146,43 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                         logger.info(f"Executing task {task_id}: {tool_name}")
                         
                         try:
-                            # GENERIC INFRASTRUCTURE: Resolve {{artifact}} references in ALL tool inputs
-                            # This is a fallback - prompts should teach LLM to avoid this pattern
-                            resolved_inputs = {}
-                            for input_key, input_value in inputs.items():
-                                if isinstance(input_value, str) and ('{{' in input_value or (input_value.startswith('{') and input_value.endswith('}') and ' ' not in input_value)):
+                            # GENERIC INFRASTRUCTURE: Resolve {{artifact}} references in ALL tool inputs (including nested dicts)
+                            def resolve_artifact_references(value, path=""):
+                                """Recursively resolve {{artifact}} references in any value (dict, list, str)"""
+                                if isinstance(value, str) and ('{{' in value or (value.startswith('{') and value.endswith('}') and ' ' not in value)):
                                     # Extract artifact name from {{artifact_name}} or {artifact_name}
-                                    artifact_ref = input_value.strip('{}').strip()
+                                    artifact_ref = value.strip('{}').strip()
                                     if artifact_ref in artifacts:
                                         artifact_data = artifacts[artifact_ref]
                                         # Extract content from dict artifacts
                                         if isinstance(artifact_data, dict):
                                             if 'path' in artifact_data:
-                                                # For file artifacts (images, audio, PDFs, etc.)
-                                                resolved_inputs[input_key] = artifact_data['path']
+                                                return artifact_data['path']
                                             elif 'content' in artifact_data:
-                                                resolved_inputs[input_key] = artifact_data['content']
+                                                return artifact_data['content']
                                             elif 'text' in artifact_data:
-                                                resolved_inputs[input_key] = artifact_data['text']
+                                                return artifact_data['text']
                                             elif 'dataframe_key' in artifact_data:
-                                                # Extract dataframe_key for dataframe operations
-                                                resolved_inputs[input_key] = artifact_data['dataframe_key']
+                                                resolved = artifact_data['dataframe_key']
+                                                logger.info(f"[ARTIFACT_RESOLVE] Resolved {{{{{artifact_ref}}}}} in {tool_name}.{path} → {resolved}")
+                                                return resolved
                                             else:
-                                                resolved_inputs[input_key] = artifact_data
+                                                return artifact_data
                                         else:
-                                            resolved_inputs[input_key] = artifact_data
-                                        logger.info(f"[ARTIFACT_RESOLVE] Resolved {{{{{artifact_ref}}}}} in {tool_name}.{input_key}")
-                                    else:
-                                        resolved_inputs[input_key] = input_value
-                                else:
-                                    resolved_inputs[input_key] = input_value
+                                            return artifact_data
+                                return value
                             
-                            # Use resolved inputs
-                            inputs = resolved_inputs
+                            def resolve_inputs_recursively(obj, path=""):
+                                """Recursively resolve artifacts in nested structures"""
+                                if isinstance(obj, dict):
+                                    return {k: resolve_inputs_recursively(v, f"{path}.{k}" if path else k) for k, v in obj.items()}
+                                elif isinstance(obj, list):
+                                    return [resolve_inputs_recursively(item, f"{path}[{i}]") for i, item in enumerate(obj)]
+                                else:
+                                    return resolve_artifact_references(obj, path)
+                            
+                            # Apply recursive resolution to all inputs
+                            inputs = resolve_inputs_recursively(inputs)
                             
                             # Tool execution routing
                             if tool_name == "render_js_page":
@@ -188,7 +192,7 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             elif tool_name == "fetch_text":
                                 logger.info(f"[TOOL_EXEC] {task_id}: fetch_text - URL: {inputs['url']}")
                                 result = await fetch_text(inputs["url"])
-                                logger.info(f"[TOOL_RESULT] {task_id}: fetch_text - Text length: {len(result.get('text', ''))}")
+                                logger.info(f"[TOOL_RESULT] {task_id}: fetch_text - Text length: {len(result.get('content', ''))}")
                             elif tool_name == "download_file":
                                 logger.info(f"[TOOL_EXEC] {task_id}: download_file - URL: {inputs['url']}")
                                 result = await download_file(inputs["url"])
@@ -225,7 +229,7 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             elif tool_name == "parse_html_tables":
                                 result = parse_html_tables(inputs["path_or_html"])
                             elif tool_name == "parse_pdf_tables":
-                                result = parse_pdf_tables(inputs["path"], inputs.get("pages", "all"))
+                                result = parse_pdf_tables(inputs["path"], inputs.get("pages") or "all")
                             elif tool_name == "extract_patterns":
                                 logger.info(f"[TOOL_EXEC] {task_id}: extract_patterns - Pattern: {inputs.get('pattern_type')}")
                                 text = inputs["text"]
@@ -260,8 +264,6 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                     prompt = re.sub(r'\{\{' + re.escape(artifact_key) + r'\}\}', artifact_value, prompt)
                                     prompt = re.sub(r'\{' + re.escape(artifact_key) + r'\}', artifact_value, prompt)
                                 system_prompt = inputs.get("system_prompt", "You are a helpful assistant.")
-                                if "ONLY the" not in system_prompt and "only the" not in system_prompt:
-                                    system_prompt += "\n\nIMPORTANT: Return ONLY the extracted value, no explanations or additional text."
                                 result = await call_llm(prompt, system_prompt, inputs.get("max_tokens", 2000), inputs.get("temperature", 0))
                                 logger.info(f"[TOOL_RESULT] {task_id}: call_llm - Response: {result[:200]}...")
                             elif tool_name == "answer_submit":
@@ -696,6 +698,8 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
             if from_key:
                 logger.warning(f"[ARTIFACT_SELECTION] No candidates found, trying plan-specified '{from_key}'")
                 cleaned_key = from_key.strip()
+                # Strip template markers {{}} from artifact references
+                cleaned_key = re.sub(r"^\{\{|\}\}$", "", cleaned_key).strip()
                 cleaned_key = re.sub(r"^static value\s*['\"]?|['\"]?$", "", cleaned_key)
                 cleaned_key = re.sub(r"^['\"]|['\"]$", "", cleaned_key).strip()
                 
@@ -773,9 +777,26 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
             # Handle extract_patterns result format: {'matches': [...], 'count': N, 'pattern_type': 'email'}
             if isinstance(final_answer, dict) and 'pattern_type' in final_answer and 'count' in final_answer:
                 logger.info(f"[ARTIFACT_EXTRACTION] Detected extract_patterns result: {final_answer}")
-                # Extract just the count for "how many" questions
-                final_answer = final_answer['count']
-                logger.info(f"[ARTIFACT_EXTRACTION] Extracted count: {final_answer}")
+                # Check if question asks for count vs actual value
+                is_count_question = False
+                if page_text:
+                    count_keywords = ['how many', 'number of', 'count of', 'count the']
+                    is_count_question = any(keyword in page_text.lower() for keyword in count_keywords)
+                
+                if is_count_question:
+                    # Extract just the count for "how many" questions
+                    final_answer = final_answer['count']
+                    logger.info(f"[ARTIFACT_EXTRACTION] Count question detected - extracted count: {final_answer}")
+                else:
+                    # Extract the actual matched value(s)
+                    matches = final_answer['matches']
+                    if matches and len(matches) > 0:
+                        # If single match, return the value directly
+                        final_answer = matches[0] if len(matches) == 1 else matches
+                        logger.info(f"[ARTIFACT_EXTRACTION] Value question detected - extracted matches: {final_answer}")
+                    else:
+                        final_answer = final_answer['count']
+                        logger.info(f"[ARTIFACT_EXTRACTION] No matches found - falling back to count: {final_answer}")
             
             # Infrastructure: Handle chart result format: {'chart_path': 'path', 'unique_categories': N}
             # For "how many categories" questions, extract the count
@@ -1105,6 +1126,19 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
                 break
         
         logger.info(f"[PIPELINE_COMPLETE] Quiz chain complete. Solved {len(quiz_chain)} quizzes")
+        
+        # Calculate summary statistics
+        total_time = sum(qr.total_time for qr in quiz_runs.values())
+        successful_quizzes = [qc for qc in quiz_chain if qc.get("correct")]
+        
+        # Print clean summary
+        print("\n" + "="*60)
+        print("QUIZ SOLVER SUMMARY")
+        print("="*60)
+        print(f"Total Quizzes Solved: {len(successful_quizzes)}/{len(quiz_chain)}")
+        print(f"Total Execution Time: {total_time:.2f}s")
+        print(f"Average Time per Quiz: {total_time/len(quiz_chain):.2f}s")
+        print("="*60 + "\n")
         
         # Log final cache statistics
         quiz_cache.log_stats()

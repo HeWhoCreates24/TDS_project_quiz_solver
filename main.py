@@ -102,7 +102,7 @@ async def solve(payload: VerifyPayload):
     }
     
     logger.info(f"[API_RESPONSE] Status: {response_data['status']}, Duration: {response_data['execution_time']}")
-    logger.info(f"[API_RESPONSE_BODY] {json.dumps(response_data, indent=2)[:500]}...")
+    logger.debug(f"[API_RESPONSE_BODY] {json.dumps(response_data, indent=2)[:500]}...")
     
     # Remove sensitive data from response
     if "pipeline_result" in response_data and "artifacts" in response_data["pipeline_result"]:

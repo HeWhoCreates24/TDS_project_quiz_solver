@@ -194,44 +194,7 @@ CRITICAL: Check if the answer is ALREADY in the artifacts!
 - If vision_result contains the extracted value → NO MORE TOOLS NEEDED, answer is ready!
 - If statistics are already calculated → NO MORE TOOLS NEEDED, answer is ready!
 - DO NOT make unnecessary API calls or fetch operations when the answer is already available
-- DO NOT call submit endpoints - the system handles submission automatically
-
-Understanding multi-step workflows (GENERALIZED for all data types):
-
-DATA ANALYSIS workflows:
-- When instructions mention filtering/selecting a subset, FIRST filter, THEN calculate
-- Example: "sum values >= 100" requires TWO steps:
-  1. dataframe_ops(op="filter", params={"dataframe_key": "df_0", "condition": "column >= 100"}) → produces artifact "filtered_df" containing {"dataframe_key": "df_1"}
-  2. calculate_statistics(dataframe="df_1", stats=["sum"]) → USE THE ACTUAL KEY "df_1", NOT the artifact name
-
-**CRITICAL DATAFRAME REFERENCING:**
-- parse_csv creates dataframe with key "df_0", stored in artifact (e.g., csv_data: {"dataframe_key": "df_0"})
-- dataframe_ops filter creates NEW dataframe with key "df_1", stored in artifact (e.g., filtered_df: {"dataframe_key": "df_1"})
-- When referencing dataframes in subsequent operations, use the ACTUAL KEY ("df_0", "df_1"), NOT the artifact name
-- Check artifact contents to find the actual dataframe_key value to use
-
-VISION/IMAGE workflows:
-- Raw image/PDF → analyze_image or ocr_image → extract text/data → use in calculations
-
-API workflows:
-- fetch_api → extract relevant fields → transform/calculate as needed
-
-SCRAPING workflows:
-- fetch_text → might get HTML with <script> tags → WAIT for render_js_page (automatic)
-- After render_js_page completes → check rendered text for answer
-- If rendered text contains the answer (e.g., "Secret code is 1371") → STOP, no more tools needed
-- DO NOT call POST requests to submit - that's handled automatically
-
-MULTIMODAL workflows:
-- Combine: audio transcription + image vision + data analysis as needed
-- Chain results: output of one tool becomes input to next
-
-Tool chaining patterns:
-- parse_csv → dataframe (e.g., "df_0")
-- dataframe_ops with filter → NEW dataframe (e.g., "df_1")  
-- calculate_statistics → uses latest/appropriate dataframe
-- analyze_image → vision_result → can be used in further processing
-- fetch_text → rendered_page (automatic if JS detected) → answer extracted automatically"""
+- DO NOT call submit endpoints - the system handles submission automatically"""
 
     # transcription_text already cached from above
     # Check what we have and what we're missing
@@ -261,11 +224,17 @@ IMPORTANT RULES:
    - If rendered_page has meaningful text (e.g., "Secret code is 1371") → NO MORE TOOLS NEEDED
    - If statistics are calculated → NO MORE TOOLS NEEDED
    - If vision_result has extracted data → NO MORE TOOLS NEEDED
+   - If API response contains requested field (e.g., fetch_from_api_result_1.data.secret_code) → NO MORE TOOLS NEEDED
    - DO NOT make redundant API calls or POST requests
-   - The system handles answer extraction and submission automatically
+   
+5. **WHEN ANSWER IS READY**: If the answer is in artifacts, respond with reasoning explaining:
+   - Which artifact contains the answer
+   - What the answer value is
+   - Why no more tools are needed
+   - Example: "The secret_code field is 7891 in fetch_from_api_result_1.data.secret_code. No more tools needed."
 
 TASK: Based on the instructions above, decide if you need to call ANY tools, or if the answer is already ready.
-- If answer is ready in artifacts → DO NOT call any tools (respond with reasoning only)
+- If answer is ready in artifacts → DO NOT call any tools (respond with reasoning explaining where the answer is)
 - If more work needed → call the necessary tools using function calling
 
 Use function calling ONLY when tools are actually needed.
@@ -275,7 +244,7 @@ Your reasoning should be brief. Focus on checking what's ALREADY DONE before cal
     logger.info(f"[GENERATE_NEXT_TASKS] Transcription text: {transcription_text}")
     logger.info(f"[GENERATE_NEXT_TASKS] Artifacts summary keys: {list(artifacts_summary.keys())}")
     logger.info(f"[GENERATE_NEXT_TASKS] Has statistics: {has_statistics}, Has dataframe: {has_dataframe}")
-    logger.info(f"[GENERATE_NEXT_TASKS] Full prompt sent to LLM:\n{prompt}")
+    logger.debug(f"[GENERATE_NEXT_TASKS] Prompt length: {len(prompt)} chars")
 
     # Force tool usage if we have data but no calculations yet
     # This prevents the LLM from saying "no tasks needed" when calculations are still required
@@ -319,7 +288,7 @@ Your reasoning should be brief. Focus on checking what's ALREADY DONE before cal
             data = response.json()
             
             message = data["choices"][0]["message"]
-            logger.info(f"[GENERATE_NEXT_TASKS] LLM response message: {message}")
+            logger.debug(f"[GENERATE_NEXT_TASKS] LLM response message: {message}")
             
             # Check if model wants to call tools
             if message.get("tool_calls"):
@@ -406,7 +375,7 @@ Your reasoning should be brief. Focus on checking what's ALREADY DONE before cal
             else:
                 # LLM decided no more tools needed - likely answer is already in artifacts
                 logger.info(f"[NEXT_TASKS] LLM determined no additional tools needed - answer likely ready in artifacts")
-                logger.info(f"[NEXT_TASKS] LLM reasoning: {message.get('content', 'No reasoning provided')}")
+                logger.debug(f"[NEXT_TASKS] LLM reasoning: {message.get('content', 'No reasoning provided')}")
                 return []
                 
     except Exception as e:

@@ -71,8 +71,9 @@ async def call_llm(
         logger.info(f"[LLM_CALL] Using tools: {[t['function']['name'] for t in tools]}")
         logger.info(f"[LLM_CALL] Tool choice mode: {tool_choice}")
     
-    logger.info(f"[LLM_CALL] System prompt: {system_prompt[:100]}...")
-    logger.info(f"[LLM_CALL] User prompt: {prompt[:200]}...")
+    # Reduced logging - only show truncated prompts
+    logger.debug(f"[LLM_CALL] System prompt: {system_prompt[:100]}...")
+    logger.debug(f"[LLM_CALL] User prompt: {prompt[:200]}...")
     
     async with httpx.AsyncClient() as client:
         response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
@@ -85,12 +86,12 @@ async def call_llm(
             if message.get("tool_calls"):
                 logger.info(f"[LLM_RESPONSE] Tool calls: {len(message['tool_calls'])}")
             else:
-                logger.info(f"[LLM_RESPONSE] Text response: {message.get('content', '')[:300]}...")
+                logger.debug(f"[LLM_RESPONSE] Text response: {message.get('content', '')[:100]}...")
             return message
         else:
             # Return just the text content
             answer_text = data["choices"][0]["message"]["content"]
-            logger.info(f"[LLM_RESPONSE] Content: {answer_text[:300]}...")
+            logger.debug(f"[LLM_RESPONSE] Content: {answer_text[:100]}...")
             return answer_text.strip()
 
 
@@ -282,8 +283,8 @@ Remember: Call ALL tools needed in ONE response. We can execute multiple tools i
     tools = get_tool_definitions()
     
     # Log the full prompt and tools being sent to LLM
-    logger.info(f"[LLM_PLAN_PROMPT] System: {system_prompt[:500]}...")
-    logger.info(f"[LLM_PLAN_PROMPT] User prompt: {prompt}")
+    logger.debug(f"[LLM_PLAN_PROMPT] System: {system_prompt[:200]}...")
+    logger.debug(f"[LLM_PLAN_PROMPT] User prompt length: {len(prompt)} chars")
     logger.info(f"[LLM_PLAN_TOOLS] Available tools: {[t['function']['name'] for t in tools]}")
     logger.info(f"[LLM_PLAN_TOOLS] Tool choice mode: {tool_choice_mode}")
     
@@ -444,172 +445,73 @@ Use download_file + transcribe_audio to get instructions from the audio.
                 previous_context += f"  - Server response: {error_msg}\n"
         previous_context += "\nUSE THIS INFORMATION TO GENERATE A BETTER PLAN FOR THIS ATTEMPT!\n"
     
-    system_prompt = """
+    system_prompt = f"""
 You are an execution planner for an automated quiz-solving agent. Your job is to analyze a rendered quiz page and generate a machine-executable JSON plan.
 
 OUTPUT FORMAT - YOU MUST OUTPUT VALID JSON ONLY:
 
-=== EXAMPLE 1: VISUALIZATION QUIZ (chart + count categories) ===
-QUIZ TEXT: "Download CSV, create bar chart of 'category' vs 'total_sales', return number of categories"
-
-{
-  "submit_url": "http://example.com/submit",
-  "origin_url": "http://example.com/quiz",
+JSON STRUCTURE:
+{{
+  "submit_url": "<extracted from page text>",
+  "origin_url": "<the quiz URL>",
   "tasks": [
-    {
+    {{
       "id": "task_1",
-      "tool_name": "parse_csv",
-      "inputs": {"url": "http://example.com/data.csv"},
-      "produces": [{"key": "csv_data"}],
-      "notes": "Parse CSV - produces artifact named 'csv_data'"
-    },
-    {
-      "id": "task_2",
-      "tool_name": "create_chart",
-      "inputs": {
-        "dataframe": "{{csv_data}}",
-        "chart_type": "bar",
-        "x_col": "category",
-        "y_col": "total_sales",
-        "title": "Sales by Category",
-        "output_path": "chart.png"
-      },
-      "produces": [{"key": "chart_result"}],
-      "notes": "Create chart - uses dataframe from csv_data artifact"
-    }
+      "tool_name": "<tool_name>",
+      "inputs": {{<tool parameters>}},
+      "produces": [{{"key": "<artifact_name>"}}],
+      "notes": "<what this task does>"
+    }}
   ],
-  "final_answer_spec": {
-    "type": "number",
-    "from": "chart_result.unique_categories"
-  },
-  "request_body": {
+  "final_answer_spec": {{
+    "type": "<string|number|boolean>",
+    "from": "<artifact_key or literal value>"
+  }},
+  "request_body": {{
     "email_key": "email",
     "secret_key": "secret",
     "url_value": "url",
     "answer_key": "answer"
-  }
-}
+  }}
+}}
 
-KEY POINTS FOR VISUALIZATION:
-- create_chart returns: {"chart_path": "...", "unique_categories": 5}
-- The unique_categories field contains the COUNT of unique values in x_col
-- For "how many categories" questions → use create_chart, reference .unique_categories
-- Do NOT use dataframe_ops count for category counting - use create_chart!
-- Reference artifacts using {{artifact_name}} syntax - system auto-extracts dataframe_key
+CRITICAL RULES:
 
-=== EXAMPLE 2: DATA TRANSFORMATION (pivot + sum) ===
-{
-  "submit_url": "http://example.com/submit",
-  "origin_url": "http://example.com/quiz",
-  "tasks": [
-    {
-      "id": "task_1",
-      "tool_name": "parse_csv",
-      "inputs": {"url": "http://example.com/data.csv"},
-      "produces": [{"key": "csv_data"}],
-      "notes": "Parse CSV"
-    },
-    {
-      "id": "task_2",
-      "tool_name": "dataframe_ops",
-      "inputs": {
-        "op": "pivot",
-        "params": {
-          "dataframe_key": "{{csv_data}}",
-          "index": "category",
-          "columns": "month",
-          "values": "sales"
-        }
-      },
-      "produces": [{"key": "pivoted_data"}],
-      "notes": "Pivot - uses {{csv_data}} reference"
-    },
-    {
-      "id": "task_3",
-      "tool_name": "dataframe_ops",
-      "inputs": {
-        "op": "sum",
-        "params": {
-          "dataframe_key": "{{pivoted_data}}",
-          "column": "January"
-        }
-      },
-      "produces": [{"key": "sum_result"}],
-      "notes": "Sum - uses {{pivoted_data}} reference"
-    }
-  ],
-  "final_answer_spec": {
-    "type": "number",
-    "from": "sum_result"
-  },
-  "request_body": {
-    "email_key": "email",
-    "secret_key": "secret",
-    "url_value": "url",
-    "answer_key": "answer"
-  }
-}
+1. ARTIFACT REFERENCES:
+   - Use {{{{artifact_name}}}} syntax to reference previous task outputs
+   - Example: task_1 produces "csv_data" → task_2 uses "{{{{csv_data}}}}"
+   - NEVER hardcode "df_0" - always use {{{{artifact}}}} pattern
+   - System auto-extracts dataframe_key from artifacts
 
-CRITICAL task chaining rules:
-- parse_csv returns: {"dataframe_key": "df_X"} where X auto-increments
-- To reference that dataframe: use {{artifact_name}} syntax
-- Example: task_1 produces "csv_data" → task_2 uses "{{csv_data}}"
-- Example: task_2 produces "pivoted_data" → task_3 uses "{{pivoted_data}}"
-- The system will automatically extract the dataframe_key field
-- NEVER hardcode "df_0" - always use the {{artifact}} reference pattern
+2. NESTED FIELD ACCESS:
+   - Use dot notation for nested fields: "artifact.field.subfield"
+   - Example: "api_result.data.secret_code" extracts nested value
+   - Example: "chart_result.unique_categories" gets count from chart
 
-CRITICAL dataframe_ops STRUCTURE:
-- MUST use "op" (NOT "operation")
-- MUST use "params" object with "dataframe_key" inside
-- WRONG: {"operation": "pivot", "dataframe": "df_0", "index": "...", ...}
-- RIGHT: {"op": "pivot", "params": {"dataframe_key": "df_0", "index": "...", ...}}
+3. TOOL NAMING:
+   - Use EXACT tool names from documentation below
+   - fetch_from_api (NOT "call_api")
+   - create_chart (NOT "make_chart")
+   - dataframe_ops (NOT "transform_data" for row operations)
 
-CRITICAL: The request_body format above is FIXED - copy it EXACTLY as shown!
-- "email_key": "email" means the field name is "email" 
-- "secret_key": "secret" means the field name is "secret"
-- "url_value": "url" means the field name is "url" (NOT the actual URL!)
-- "answer_key": "answer" means the field name is "answer" (NOT the actual answer value!)
+4. REQUEST_BODY FORMAT (COPY EXACTLY):
+   - "email_key": "email" (the field name, not actual email)
+   - "secret_key": "secret" (the field name, not actual secret)
+   - "url_value": "url" (the field name, not actual URL)
+   - "answer_key": "answer" (the field name, not actual answer)
+   - DO NOT put actual values in request_body!
 
-DO NOT put actual values like URLs or answer numbers in request_body!
+5. WHEN NO TOOLS NEEDED:
+   - tasks: []
+   - final_answer_spec.from: "<actual answer value>"
+   - Examples: literal strings, computed numbers, obvious answers
 
-IMPORTANT RULES:
-1. Submit URL must be extracted from the page text
-2. Tasks array contains the work to do (can be empty if answer is obvious/direct)
-3. final_answer_spec.from references an artifact key from tasks OR **THE ACTUAL ANSWER VALUE** if no tools needed
-4. request_body MUST be copied exactly as shown in the example above
-5. Return ONLY valid JSON, no markdown wrapper, no extra text
-
-WHEN NO TOOLS ARE NEEDED (answer is obvious or requires simple computation):
-- Set tasks: []
-- Set final_answer_spec.from to THE ACTUAL ANSWER VALUE (not a placeholder)
-- Examples:
-  * Page says "answer is literal_test_value" → from: "literal_test_value"
-  * Page asks "what is 1+2+3+...+10?" → from: "55" (compute it yourself)
-  * Page says "enter any value" → from: "hello" (pick any reasonable value)
-
-WHEN TOOLS ARE NEEDED:
-- Create task objects that produce artifacts
-- Set final_answer_spec.from to reference an artifact key (e.g., "csv_data", "llm_result_1")
+6. WHEN TOOLS NEEDED:
+   - Create task chain with artifact references
+   - final_answer_spec.from: "<artifact_key>" or "<artifact.field>"
+   - Use dot notation for nested extraction
 
 {get_tool_usage_examples()}
-
-CRITICAL ARTIFACT REFERENCE RULES:
-- parse_csv produces: {"dataframe_key": "df_X"} where X is auto-incremented (df_0, df_1, df_2, etc.)
-- To reference the dataframe in next task: use the "produces" from previous task
-  * Task 1 produces: [{"key": "dataframe_key", "type": "df_0"}]
-  * Task 2 uses: {"params": {"dataframe_key": "df_0"}} - match the "type" value
-- DON'T hardcode df_0 everywhere - each parse_csv creates a NEW dataframe with unique key
-- Each dataframe operation (pivot, filter) creates a NEW dataframe: df_0 → filter → df_1
-- ALWAYS reference the actual dataframe key from the previous task's "produces"
-- dataframe_ops filter creates NEW artifact containing {"dataframe_key": "df_1"} 
-- In subsequent tasks, use the ACTUAL dataframe key ("df_0", "df_1"), not the artifact name
-- **parse_csv REQUIRES URL OR FILE PATH**: NEVER use {{artifact}} syntax in parse_csv path!
-  * ✅ CORRECT: {"tool_name": "parse_csv", "inputs": {"url": "http://example.com/data.csv"}}
-  * ❌ WRONG: {"tool_name": "parse_csv", "inputs": {"path": "{{csv_data}}"}}
-- **call_llm ARTIFACT REFERENCES**: Use {{artifact_name}} in prompts ONLY
-  * ✅ CORRECT: {"tool_name": "call_llm", "inputs": {"prompt": "Analyze {{csv_data}}"}}
-  * This is for call_llm prompts only, not for parse_csv/parse_json/etc!
-- CSV files without headers have NUMERIC column names: "0", "1", "2", etc. (as strings!)
 """
     
     prompt = f"""
@@ -643,5 +545,5 @@ OUTPUT ONLY THE JSON PLAN, NO OTHER TEXT.
         use_tools=False  # Text-based JSON generation
     )
     
-    logger.info(f"[LLM_PLAN] Raw plan response: {plan_text[:500]}")
+    logger.debug(f"[LLM_PLAN] Raw plan response: {plan_text[:200]}...")
     return plan_text
