@@ -4,10 +4,182 @@ Fast deterministic checks + LLM-based evaluation
 import re
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from llm_client import call_llm
 
 logger = logging.getLogger(__name__)
+
+# Global statistics for completion check optimization
+completion_check_stats = {
+    "checks_performed": 0,
+    "checks_skipped": 0,
+    "llm_calls_avoided": 0,
+    "fast_checks_used": 0,
+    "time_saved_seconds": 0.0
+}
+
+
+def classify_operation(tool_name: str) -> str:
+    """Classify operation based on generic semantic patterns.
+    Returns: 'terminal', 'non_terminal', or 'intermediate'
+    
+    This uses semantic analysis, not hardcoded tool names.
+    Works for ANY quiz type: data analysis, vision, APIs, scraping, etc.
+    """
+    tool_lower = tool_name.lower()
+    
+    # TERMINAL PATTERNS - Operations that produce final results
+    terminal_patterns = [
+        'calculate', 'compute', 'aggregate', 'analyze',  # Calculations
+        'extract', 'get_value', 'find_answer',           # Extractions
+        'summarize', 'conclude', 'finalize',             # Finalizations
+        'visualize', 'plot', 'chart', 'graph',           # Visualizations
+        'measure', 'count', 'sum', 'mean', 'stats',      # Statistical operations
+        'ocr', 'vision', 'detect', 'recognize',          # Vision/image analysis
+        'call_llm', 'generate', 'report',                # LLM/generation (final step)
+    ]
+    
+    # NON-TERMINAL PATTERNS - Operations that are preprocessing
+    non_terminal_patterns = [
+        'download', 'fetch', 'get', 'retrieve',          # Data acquisition
+        'parse', 'read', 'load', 'open',                 # Data loading
+        'render', 'request', 'scrape_page',              # Page rendering
+        'transcribe', 'convert', 'decode',               # Format conversion
+        'filter', 'select', 'transform', 'clean',        # Data preparation
+        'split', 'join', 'merge', 'reshape',             # Data manipulation
+    ]
+    
+    # Check terminal patterns
+    if any(pattern in tool_lower for pattern in terminal_patterns):
+        return 'terminal'
+    
+    # Check non-terminal patterns
+    if any(pattern in tool_lower for pattern in non_terminal_patterns):
+        return 'non_terminal'
+    
+    # Default to intermediate (uncertain - need LLM check)
+    return 'intermediate'
+
+
+# Explicit overrides for all 24 known tools
+OPERATION_OVERRIDES = {
+    # NON-TERMINAL: Data acquisition and preprocessing
+    'render_js_page': 'non_terminal',         # Fetches HTML content
+    'fetch_text': 'non_terminal',             # Fetches text from URL
+    'fetch_from_api': 'non_terminal',         # Fetches API data
+    'download_file': 'non_terminal',          # Downloads binary files
+    'parse_csv': 'non_terminal',              # Parses CSV into DataFrame
+    'parse_excel': 'non_terminal',            # Parses Excel into DataFrame
+    'parse_json_file': 'non_terminal',        # Parses JSON into data
+    'parse_html_tables': 'non_terminal',      # Extracts tables from HTML
+    'parse_pdf_tables': 'non_terminal',       # Extracts tables from PDF
+    'clean_text': 'non_terminal',             # Cleans/normalizes text
+    'extract_patterns': 'non_terminal',       # Extracts patterns via regex
+    'transform_data': 'non_terminal',         # Reshapes data (pivot/melt)
+    'transcribe_audio': 'non_terminal',       # Audio to text
+    'extract_audio_metadata': 'non_terminal', # Gets audio metadata
+    
+    # INTERMEDIATE: Could be preprocessing or final analysis
+    'dataframe_ops': 'intermediate',          # Filter/sum/mean - varies by context
+    'apply_ml_model': 'intermediate',         # ML model - varies by task
+    'geospatial_analysis': 'intermediate',    # Spatial analysis - varies
+    
+    # TERMINAL: Produce final results
+    'calculate_statistics': 'terminal',       # Computes final statistics
+    'analyze_image': 'terminal',              # Vision analysis results
+    'create_chart': 'terminal',               # Creates visualization
+    'create_interactive_chart': 'terminal',   # Creates interactive viz
+    'make_plot': 'terminal',                  # Creates plot
+    'generate_narrative': 'terminal',         # Generates final narrative
+    'call_llm': 'terminal',                   # LLM produces final answer
+    'zip_base64': 'terminal',                 # Final packaging for submission
+}
+
+
+def get_operation_type(tool_name: str) -> str:
+    """Get operation type with override support.
+    Checks explicit overrides first, then uses semantic classification.
+    """
+    # Check explicit overrides
+    if tool_name in OPERATION_OVERRIDES:
+        return OPERATION_OVERRIDES[tool_name]
+    
+    # Use semantic classification
+    return classify_operation(tool_name)
+
+
+def should_check_completion(
+    last_task: Optional[Dict[str, Any]], 
+    artifacts: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """Determine if completion check is needed based on last operation.
+    Uses GENERIC semantic classification - works for ANY tool/quiz type.
+    
+    Returns:
+        tuple: (should_check: bool, reason: str)
+    """
+    # Always check if no task executed (edge case)
+    if not last_task:
+        return True, "no_task_info"
+    
+    tool_name = last_task.get("tool_name", "")
+    
+    # Get operation type using semantic classification
+    op_type = get_operation_type(tool_name)
+    
+    # SKIP CHECK: Non-terminal operations (obviously incomplete)
+    if op_type == 'non_terminal':
+        logger.info(f"[COMPLETION_SKIP] Non-terminal operation '{tool_name}' - skipping check")
+        return False, f"non_terminal_{tool_name}"
+    
+    # FORCE CHECK: Terminal operations (likely complete)
+    if op_type == 'terminal':
+        logger.info(f"[COMPLETION_CHECK] Terminal operation '{tool_name}' - checking completion")
+        return True, f"terminal_{tool_name}"
+    
+    # SMART CHECK: Artifact-based detection (generic for all data types)
+    # Check for ANY final result artifacts (not just statistics)
+    final_result_indicators = [
+        'statistics', 'result', 'answer', 'value', 'output',  # Generic results
+        'vision_result', 'ocr_text', 'detected_',             # Vision/OCR
+        'api_response', 'response_data',                      # API data
+        'chart_path', 'plot_path', 'visualization',           # Visualizations
+        'summary', 'conclusion', 'final_',                    # Summaries
+    ]
+    
+    has_final_result = any(
+        indicator in str(k).lower() or indicator in str(v)
+        for k, v in artifacts.items()
+        for indicator in final_result_indicators
+    )
+    
+    if has_final_result:
+        logger.info("[COMPLETION_CHECK] Final result artifact detected - checking completion")
+        return True, "final_result_present"
+    
+    # SMART CHECK: Extracted values (generic pattern)
+    has_extracted = any(k.startswith('extracted_') for k in artifacts.keys())
+    if has_extracted:
+        logger.info("[COMPLETION_CHECK] Extracted values found - checking completion")
+        return True, "extracted_values_present"
+    
+    # DEFAULT: Check for intermediate operations (uncertain)
+    logger.info(f"[COMPLETION_CHECK] Intermediate operation '{tool_name}' - checking")
+    return True, f"intermediate_{tool_name}"
+
+
+def log_completion_stats():
+    """Log completion check statistics"""
+    stats = completion_check_stats
+    total = stats["checks_performed"] + stats["checks_skipped"]
+    skip_rate = (stats["checks_skipped"] / total * 100) if total > 0 else 0
+    
+    logger.info(
+        f"[COMPLETION_STATS] Checks: {stats['checks_performed']}, "
+        f"Skipped: {stats['checks_skipped']}, Skip Rate: {skip_rate:.1f}%, "
+        f"LLM Calls Avoided: {stats['llm_calls_avoided']}, "
+        f"Time Saved: {stats['time_saved_seconds']:.1f}s"
+    )
 
 
 def check_completion_fast(artifacts: Dict[str, Any], page_text: str = "", transcription_text: str = "") -> Optional[Dict[str, Any]]:
@@ -162,10 +334,36 @@ def check_completion_fast(artifacts: Dict[str, Any], page_text: str = "", transc
     return None
 
 
-async def check_plan_completion(plan_obj: Dict[str, Any], artifacts: Dict[str, Any], page_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Check if plan execution is complete - uses fast checks first, LLM only when needed"""
+async def check_plan_completion(
+    plan_obj: Dict[str, Any], 
+    artifacts: Dict[str, Any], 
+    page_data: Dict[str, Any],
+    last_executed_task: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Check if plan execution is complete - with smart skip logic, fast checks, and LLM fallback"""
     
-    # FIRST: Try fast deterministic checks (no LLM call)
+    # PHASE 1: Smart skip logic - avoid unnecessary checks
+    should_check, skip_reason = should_check_completion(last_executed_task, artifacts)
+    
+    if not should_check:
+        logger.info(f"[COMPLETION_SKIP] Skipping completion check - reason: {skip_reason}")
+        completion_check_stats["checks_skipped"] += 1
+        completion_check_stats["llm_calls_avoided"] += 1
+        completion_check_stats["time_saved_seconds"] += 1.0  # Estimate 1s per skipped check
+        return {
+            "answer_ready": False,
+            "needs_more_tasks": True,
+            "reason": f"Skipped check after {skip_reason}",
+            "recommended_next_action": "Continue execution",
+            "fast_check": True,
+            "check_skipped": True
+        }
+    
+    # Track that we're performing a check
+    completion_check_stats["checks_performed"] += 1
+    logger.info(f"[COMPLETION_CHECK] Performing check - reason: {skip_reason}")
+    
+    # PHASE 2: Try fast deterministic checks (no LLM call)
     page_text = page_data.get('text', '')
     
     # Extract transcription from artifacts if available (for audio quizzes)

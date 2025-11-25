@@ -203,6 +203,13 @@ IMPORTANT CONSTRAINTS:
 - Keep reasoning minimal - just enough to track what you're doing
 - Focus on ACTION, not explanation
 
+CRITICAL: Check if the answer is ALREADY in the artifacts!
+- If rendered_page_X has text like "Secret code is 1371" → NO MORE TOOLS NEEDED, answer is ready!
+- If vision_result contains the extracted value → NO MORE TOOLS NEEDED, answer is ready!
+- If statistics are already calculated → NO MORE TOOLS NEEDED, answer is ready!
+- DO NOT make unnecessary API calls or fetch operations when the answer is already available
+- DO NOT call submit endpoints - the system handles submission automatically
+
 Understanding multi-step workflows (GENERALIZED for all data types):
 
 DATA ANALYSIS workflows:
@@ -218,7 +225,10 @@ API workflows:
 - fetch_api → extract relevant fields → transform/calculate as needed
 
 SCRAPING workflows:
-- scrape_page → extract_data → clean/transform → analyze
+- fetch_text → might get HTML with <script> tags → WAIT for render_js_page (automatic)
+- After render_js_page completes → check rendered text for answer
+- If rendered text contains the answer (e.g., "Secret code is 1371") → STOP, no more tools needed
+- DO NOT call POST requests to submit - that's handled automatically
 
 MULTIMODAL workflows:
 - Combine: audio transcription + image vision + data analysis as needed
@@ -229,7 +239,7 @@ Tool chaining patterns:
 - dataframe_ops with filter → NEW dataframe (e.g., "df_1")  
 - calculate_statistics → uses latest/appropriate dataframe
 - analyze_image → vision_result → can be used in further processing
-- scrape_page → scraped_data → extract_data → final result"""
+- fetch_text → rendered_page (automatic if JS detected) → answer extracted automatically"""
 
     # transcription_text already cached from above
     # Check what we have and what we're missing
@@ -257,11 +267,19 @@ IMPORTANT RULES:
 1. Check _COMPLETED_OPERATIONS to see what's already done - DO NOT repeat these operations
 2. If a filter was already applied, use _LATEST_DATAFRAME for your next calculation
 3. Each operation should be done ONCE - check artifacts before acting
+4. **CRITICAL**: Check if answer is ALREADY AVAILABLE in artifacts:
+   - If rendered_page has meaningful text (e.g., "Secret code is 1371") → NO MORE TOOLS NEEDED
+   - If statistics are calculated → NO MORE TOOLS NEEDED
+   - If vision_result has extracted data → NO MORE TOOLS NEEDED
+   - DO NOT make redundant API calls or POST requests
+   - The system handles answer extraction and submission automatically
 
-TASK: Based on the instructions above, call the necessary tools to complete the task.
-Use function calling - do NOT write text explanations.
+TASK: Based on the instructions above, decide if you need to call ANY tools, or if the answer is already ready.
+- If answer is ready in artifacts → DO NOT call any tools (respond with reasoning only)
+- If more work needed → call the necessary tools using function calling
 
-Your reasoning should be brief. Focus on CALLING TOOLS, not explaining.
+Use function calling ONLY when tools are actually needed.
+Your reasoning should be brief. Focus on checking what's ALREADY DONE before calling new tools.
 """
 
     logger.info(f"[GENERATE_NEXT_TASKS] Transcription text: {transcription_text}")
@@ -271,9 +289,16 @@ Your reasoning should be brief. Focus on CALLING TOOLS, not explaining.
 
     # Force tool usage if we have data but no calculations yet
     # This prevents the LLM from saying "no tasks needed" when calculations are still required
-    force_tool_usage = has_dataframe and not has_statistics and transcription_text
+    # BUT: Don't force if we already have rendered text with likely answer
+    has_rendered_answer = any(
+        isinstance(v, dict) and 'text' in v and len(str(v.get('text', ''))) > 10
+        for k, v in artifacts.items() 
+        if 'rendered_' in k or 'vision_' in k or 'extracted_' in k
+    )
+    
+    force_tool_usage = has_dataframe and not has_statistics and transcription_text and not has_rendered_answer
     tool_choice_param = "required" if force_tool_usage else "auto"
-    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (force_reason: df={has_dataframe}, no_stats={not has_statistics}, has_instructions={bool(transcription_text)})")
+    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (force_reason: df={has_dataframe}, no_stats={not has_statistics}, has_instructions={bool(transcription_text)}, has_rendered_answer={has_rendered_answer})")
 
     OPEN_AI_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
     API_KEY = os.getenv("API_KEY")
@@ -389,8 +414,9 @@ Your reasoning should be brief. Focus on CALLING TOOLS, not explaining.
                 
                 return next_tasks
             else:
-                logger.warning(f"[NEXT_TASKS] LLM did not call any tools despite tool_choice=required")
-                logger.info(f"[NEXT_TASKS] No additional tasks needed")
+                # LLM decided no more tools needed - likely answer is already in artifacts
+                logger.info(f"[NEXT_TASKS] LLM determined no additional tools needed - answer likely ready in artifacts")
+                logger.info(f"[NEXT_TASKS] LLM reasoning: {message.get('content', 'No reasoning provided')}")
                 return []
                 
     except Exception as e:

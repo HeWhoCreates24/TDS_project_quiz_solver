@@ -19,7 +19,7 @@ from tool_executors import (
     dataframe_ops, make_plot, zip_base64, answer_submit
 )
 from llm_client import call_llm, call_llm_with_tools, call_llm_for_plan
-from completion_checker import check_plan_completion, format_artifact
+from completion_checker import check_plan_completion, format_artifact, log_completion_stats
 from task_generator import generate_next_tasks
 from models import QuizAttempt, QuizRun
 from tools import ToolRegistry, ScrapingTools, CleansingTools, ProcessingTools, AnalysisTools, VisualizationTools
@@ -50,6 +50,9 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
             iteration += 1
             logger.info(f"=== Iteration {iteration} ===")
             logger.info(f"Executing {len(all_tasks)} tasks")
+            
+            # Track last executed task for completion check optimization
+            last_executed_task = None
             
             # Build dependency graph and group tasks into parallel execution waves
             waves = build_dependency_graph(all_tasks, artifacts)
@@ -101,6 +104,9 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             task_id = task["id"]
                             produces = task.get("produces", [])
                             
+                            # Track last executed task
+                            last_executed_task = task
+                            
                             # Store artifacts (same logic as sequential)
                             for produce in produces:
                                 key = produce["key"]
@@ -133,6 +139,9 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                         tool_name = task["tool_name"]
                         inputs = task.get("inputs", {})
                         produces = task.get("produces", [])
+                        
+                        # Track last executed task
+                        last_executed_task = task
                         
                         logger.info(f"Executing task {task_id}: {tool_name}")
                         
@@ -427,7 +436,12 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                 break
             
             if page_data:
-                completion_status = await check_plan_completion(plan, artifacts, page_data)
+                completion_status = await check_plan_completion(
+                    plan, 
+                    artifacts, 
+                    page_data,
+                    last_executed_task=last_executed_task
+                )
                 logger.info(f"[PLAN_STATUS] {completion_status}")
                 
                 if completion_status.get("answer_ready", False):
@@ -822,6 +836,9 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
                         
                         # Log cache statistics
                         quiz_cache.log_stats()
+                        
+                        # Log completion check statistics
+                        log_completion_stats()
                         break
                 else:
                     # Answer was incorrect, check if we can retry
@@ -859,6 +876,9 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
         
         # Log final cache statistics
         quiz_cache.log_stats()
+        
+        # Log completion check statistics
+        log_completion_stats()
         
         return {
             "success": True,
