@@ -157,7 +157,10 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                         artifact_data = artifacts[artifact_ref]
                                         # Extract content from dict artifacts
                                         if isinstance(artifact_data, dict):
-                                            if 'content' in artifact_data:
+                                            if 'path' in artifact_data:
+                                                # For file artifacts (images, audio, PDFs, etc.)
+                                                resolved_inputs[input_key] = artifact_data['path']
+                                            elif 'content' in artifact_data:
                                                 resolved_inputs[input_key] = artifact_data['content']
                                             elif 'text' in artifact_data:
                                                 resolved_inputs[input_key] = artifact_data['text']
@@ -190,6 +193,13 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 logger.info(f"[TOOL_EXEC] {task_id}: download_file - URL: {inputs['url']}")
                                 result = await download_file(inputs["url"])
                                 logger.info(f"[TOOL_RESULT] {task_id}: download_file - File size: {result.get('size')} bytes")
+                            elif tool_name == "analyze_image":
+                                from tool_executors import analyze_image
+                                # The LLM uses various parameter names: 'image_path', 'image', 'file', 'path'
+                                image_path = inputs.get("image_path") or inputs.get("image") or inputs.get("file") or inputs.get("path")
+                                logger.info(f"[TOOL_EXEC] {task_id}: analyze_image - Task: {inputs['task']}, Image: {image_path}")
+                                result = await analyze_image(image_path, inputs["task"])
+                                logger.info(f"[TOOL_RESULT] {task_id}: analyze_image - Result: {result.get('result', '')[:200]}...")
                             elif tool_name == "extract_audio_metadata":
                                 from tools import MultimediaTools
                                 logger.info(f"[TOOL_EXEC] {task_id}: extract_audio_metadata - Path: {inputs.get('audio_path') or inputs.get('path')}")
@@ -560,9 +570,11 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                 continue
             
             # Include vision results
-            if isinstance(value, dict) and ('vision_result' in value or 'ocr_text' in value):
-                candidate_artifacts[key] = value
-                continue
+            if isinstance(value, dict) and ('vision_result' in value or 'ocr_text' in value or 'result' in value):
+                # Check if it's from a vision/image tool
+                if 'vision' in key.lower() or 'image' in key.lower() or 'analyze_image' in key:
+                    candidate_artifacts[key] = value
+                    continue
             
             # Include dataframe operation results
             if isinstance(value, dict) and 'result' in value and 'type' in value:
@@ -720,8 +732,14 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
                 final_answer = final_answer['prediction']
                 logger.info(f"[ARTIFACT_EXTRACTION] Extracted prediction: {final_answer}")
             
+            # Handle vision/OCR result format: {'result': 'text'}
+            if isinstance(final_answer, dict) and 'result' in final_answer and len(final_answer) == 1:
+                logger.info(f"[ARTIFACT_EXTRACTION] Detected vision/OCR result: {final_answer}")
+                final_answer = final_answer['result']
+                logger.info(f"[ARTIFACT_EXTRACTION] Extracted vision result: {final_answer}")
+            
             # Handle dataframe_ops result format: {'result': value, 'type': 'typename'}
-            if isinstance(final_answer, dict) and 'result' in final_answer and 'type' in final_answer:
+            elif isinstance(final_answer, dict) and 'result' in final_answer and 'type' in final_answer:
                 result_value = final_answer['result']
                 # Handle numpy types
                 if hasattr(result_value, 'item'):
@@ -736,7 +754,6 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
         
         # Extract secret code/value from rendered text patterns
         if isinstance(final_answer, str):
-            import re
             # Pattern: "The secret code is: 9876" or "Secret code is 1371" etc.
             secret_patterns = [
                 r'(?:secret code|code|answer|value)\s*(?:is|:)\s*[:\-]?\s*(\d+)',

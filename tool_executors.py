@@ -4,6 +4,7 @@ Handles web scraping, file parsing, data operations, and artifact generation
 """
 import os
 import json
+import re
 import base64
 import io
 import zipfile
@@ -546,6 +547,79 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         }
     else:
         return {"result": result, "type": type(result).__name__}
+
+
+async def analyze_image(image_path: str, task: str) -> Dict[str, Any]:
+    """Analyze image using vision AI (OCR, description, etc.)"""
+    try:
+        # Read image and encode to base64
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # Determine task-specific prompt
+        if task == "ocr":
+            system_prompt = "You are an OCR tool. Extract and return ONLY the text/numbers you see in the image, nothing else."
+            user_prompt = "Extract all text and numbers from this image."
+        elif task == "describe":
+            system_prompt = "Describe the image content concisely."
+            user_prompt = "What do you see in this image?"
+        elif task == "detect_objects":
+            system_prompt = "List the objects visible in the image."
+            user_prompt = "What objects can you identify?"
+        elif task == "classify":
+            system_prompt = "Classify the image into appropriate categories."
+            user_prompt = "What category does this image belong to?"
+        else:
+            system_prompt = "Analyze this image."
+            user_prompt = "Analyze this image."
+        
+        # Call vision API
+        API_KEY = os.getenv("API_KEY")
+        OPEN_AI_BASE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
+        
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        }
+        
+        # Combine system prompt into user message for vision APIs (some don't support system messages with vision)
+        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+        
+        json_data = {
+            "model": "openai/gpt-4o-mini",  # Supports vision
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": combined_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "temperature": 0,
+            "max_tokens": 500,
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
+            if response.status_code != 200:
+                logger.error(f"[VISION_ERROR] Status: {response.status_code}, Response: {response.text}")
+            response.raise_for_status()
+            data = response.json()
+            result_text = data["choices"][0]["message"]["content"].strip()
+        
+        logger.info(f"[VISION] Task: {task}, Result: {result_text[:200]}")
+        return {"result": result_text}
+    
+    except Exception as e:
+        logger.error(f"Error analyzing image: {e}")
+        raise
 
 
 def make_plot(spec: Dict[str, Any]) -> Dict[str, Any]:

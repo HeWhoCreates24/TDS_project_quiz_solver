@@ -5,6 +5,67 @@ Defines the schema/interface for all available tools that the LLM can use
 from typing import Any, Dict, List
 
 
+def get_tool_usage_examples() -> str:
+    """
+    Generate tool usage examples dynamically from tool definitions.
+    This ensures prompts stay in sync with available tools.
+    """
+    return """
+AVAILABLE TOOLS AND USAGE:
+
+Web & Data Fetching:
+- render_js_page(url): Render webpage with JavaScript, extract text/links/code
+- fetch_text(url): Fetch raw text content from URL
+- fetch_from_api(url, method, headers, body): Call REST APIs with custom headers
+- download_file(url): Download binary files (images, audio, PDFs, etc.)
+
+File Parsing:
+- parse_csv(path OR url): Parse CSV → produces {"dataframe_key": "df_0"}
+- parse_excel(path): Parse Excel files
+- parse_json_file(path): Parse JSON files
+- parse_html_tables(path_or_html): Extract HTML tables
+- parse_pdf_tables(path, pages): Extract tables from PDFs
+
+Text Processing:
+- clean_text(text, remove_special_chars, normalize_whitespace): Clean/normalize text
+- extract_patterns(text, pattern_type, custom_pattern): Extract emails, URLs, numbers, etc.
+
+Data Transformation:
+- transform_data(dataframe, operation, params): Pivot, melt, transpose, reshape
+- dataframe_ops(op, params): Filter, sum, mean, count, select, groupby
+  * Filter creates NEW dataframe: df_0 → filter → df_1
+- calculate_statistics(dataframe, stats, columns): Calculate sum, mean, median, std, etc.
+
+Machine Learning:
+- train_linear_regression(dataframe_key, feature_columns, target_column, predict_x): sklearn regression
+- apply_ml_model(dataframe, model_type, kwargs): Apply ML models
+
+Multimedia:
+- transcribe_audio(audio_path): Speech-to-text transcription
+- analyze_image(image_path, task): Vision AI for OCR, description, object detection, classification
+  * task="ocr" extracts text/numbers from images
+  * Use for ANY image analysis, NOT call_llm (call_llm cannot process images)
+- extract_audio_metadata(path): Get audio duration, sample rate, etc.
+
+Visualization:
+- create_chart(dataframe, chart_type, x_col, y_col, title, output_path): Static charts
+- create_interactive_chart(dataframe, chart_type, x_col, y_col, title): Plotly interactive
+- make_plot(spec): Custom plotting with detailed specs
+
+Utilities:
+- call_llm(prompt, system_prompt, max_tokens, temperature): Text analysis only (NOT for images)
+- zip_base64(paths): Create zip archives
+- geospatial_analysis(dataframe, analysis_type, kwargs): Distance, geocoding, spatial joins
+- generate_narrative(dataframe, summary_stats): Generate natural language from data
+
+CRITICAL PATTERNS:
+- Images → download_file + analyze_image (task="ocr")
+- Audio → download_file + transcribe_audio
+- CSV analysis → parse_csv + dataframe_ops/calculate_statistics
+- Filtering → dataframe_ops creates NEW dataframe with new key
+"""
+
+
 def get_tool_definitions() -> List[Dict[str, Any]]:
     """Define available tools for OpenAI function calling"""
     return [
@@ -283,18 +344,18 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "analyze_image",
-                "description": "Analyze image content using vision AI",
+                "description": "Analyze image content using vision AI. Performs OCR to extract text/numbers from images, describes image content, detects objects, or classifies images. Use this for any task involving reading or understanding image files.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "image_path": {
                             "type": "string",
-                            "description": "Path to image file"
+                            "description": "Path to image file or artifact key containing image path (e.g., 'image_data')"
                         },
                         "task": {
                             "type": "string",
                             "enum": ["describe", "ocr", "detect_objects", "classify"],
-                            "description": "Analysis task to perform"
+                            "description": "Analysis task to perform: 'ocr' for extracting text/numbers, 'describe' for image description, 'detect_objects' for object detection, 'classify' for categorization"
                         }
                     },
                     "required": ["image_path", "task"]

@@ -156,31 +156,7 @@ async def generate_next_tasks(plan_obj: Dict[str, Any], artifacts: Dict[str, Any
                     "notes": "Forced CSV parsing"
                 }]
     
-    # 3. IMAGE/PDF: Force vision/OCR if present but not processed
-    has_vision_result = any('vision' in str(k).lower() or 'ocr' in str(k).lower() for k in artifacts.keys())
-    if not has_vision_result:
-        image_or_pdf_path = None
-        for key, value in artifacts.items():
-            if isinstance(value, dict):
-                content_type = value.get('content_type', '')
-                if 'image' in content_type or 'pdf' in content_type:
-                    image_or_pdf_path = value.get('path')
-                    break
-        
-        if image_or_pdf_path:
-            combined_text = f"{transcription_text or ''} {page_data.get('text', '')}".lower()
-            vision_keywords = ['describe', 'identify', 'detect', 'recognize', 'extract text', 'ocr', 'read', 'image']
-            if any(kw in combined_text for kw in vision_keywords):
-                logger.info(f"[FORCE_VISION] Image/PDF found but not processed. Forcing vision/OCR")
-                return [{
-                    "id": f"forced_vision_{len(artifacts)}",
-                    "tool_name": "analyze_image",
-                    "inputs": {"image_path": image_or_pdf_path},
-                    "produces": [{"key": f"vision_result_{len(artifacts)}", "type": "json"}],
-                    "notes": "Forced vision/OCR analysis"
-                }]
-    
-    # 4. JAVASCRIPT: Force JS rendering if HTML contains script tags but no rendered content
+    # 3. JAVASCRIPT: Force JS rendering if HTML contains script tags but no rendered content
     for key, value in artifacts.items():
         if isinstance(value, dict) and 'content' in value:
             html_content = value.get('content', '')
@@ -272,9 +248,7 @@ Links: {page_data.get('links', [])}
 {f'''INSTRUCTIONS FROM AUDIO/TEXT:
 "{transcription_text}"
 
-Available tools for data operations:
-- dataframe_ops(op="filter", params={{"dataframe_key": "df_X", "condition": "column >= value"}})
-- calculate_statistics(dataframe="df_X", stats=["sum", "mean", "median", "count", etc.])
+{get_tool_usage_examples()}
 
 Current state: Transcription ✓, Data {"✓" if has_dataframe else "✗"}, Calculations {"✓" if has_statistics else "✗"}
 ''' if transcription_text else ''}

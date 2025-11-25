@@ -5,7 +5,8 @@ Provides mock quizzes and data for comprehensive testing
 import pandas as pd
 import numpy as np
 import json
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi.responses import Response, HTMLResponse
 
 router = APIRouter()
@@ -157,7 +158,39 @@ async def test_quiz(quiz_type: str):
             detail=f"Quiz type '{quiz_type}' not found. Available: {list(quiz_templates.keys())}"
         )
     
-    return quiz_templates[quiz_type]
+    # Get quiz data
+    quiz_data = quiz_templates[quiz_type]
+    
+    # Generate HTML with images, audio, etc.
+    html_parts = [
+        "<html><head><title>Test Quiz</title></head><body>",
+        f"<p>{quiz_data['text']}</p>",
+        f"<p>Submit your answer to: {quiz_data['submit_url']}</p>"
+    ]
+    
+    # Add links
+    for link in quiz_data.get('links', []):
+        html_parts.append(f'<a href="{link}">{link}</a><br/>')
+    
+    # Add images
+    for img_src in quiz_data.get('image_sources', []):
+        html_parts.append(f'<img src="{img_src}" alt="Quiz Image"/><br/>')
+    
+    # Add audio
+    for audio_src in quiz_data.get('audio_sources', []):
+        html_parts.append(f'<audio src="{audio_src}" controls></audio><br/>')
+    
+    # Add video
+    for video_src in quiz_data.get('video_sources', []):
+        html_parts.append(f'<video src="{video_src}" controls></video><br/>')
+    
+    # Add code blocks
+    for code in quiz_data.get('code_blocks', []):
+        html_parts.append(f'<pre>{code}</pre>')
+    
+    html_parts.append("</body></html>")
+    
+    return HTMLResponse(content="\n".join(html_parts))
 
 
 # ========== TEST DATA ENDPOINTS ==========
@@ -246,7 +279,16 @@ Duplicate contact: support@example.com"""
             raise HTTPException(status_code=404, detail="PDF file not found")
     
     elif filename == "sample_image.png":
-        return Response(content=b"MOCK_IMAGE_WITH_TEXT_2048", media_type="image/png")
+        # Serve real image file
+        import os
+        image_path = os.path.join(os.path.dirname(__file__), "test-data", "sample_image.png")
+        if os.path.exists(image_path):
+            with open(image_path, "rb") as f:
+                image_content = f.read()
+            return Response(content=image_content, media_type="image/png")
+        else:
+            # Fallback to mock if file doesn't exist
+            return Response(content=b"MOCK_IMAGE_WITH_TEXT_2048", media_type="image/png")
     
     else:
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found")

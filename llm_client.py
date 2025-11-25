@@ -7,7 +7,7 @@ import json
 import logging
 from typing import Any, Dict, List
 import httpx
-from tool_definitions import get_tool_definitions
+from tool_definitions import get_tool_definitions, get_tool_usage_examples
 
 logger = logging.getLogger(__name__)
 
@@ -75,10 +75,15 @@ CRITICAL RULES:
 Common patterns:
 - Page says "answer anything" or "any value" → NO TOOLS, respond with a simple answer like "anything you want"
 - Page has links to visit/scrape → CALL render_js_page(url) to get content from those pages
+- Page has images requiring OCR → CALL download_file(url) AND analyze_image with task="ocr"
 - Page references CSV/data and asks for sum/stats → CALL parse_csv(url) AND calculate_statistics or dataframe_ops
 - Page has complex text → CALL call_llm(prompt) to extract information
 
 NEVER call fetch_from_api or any tool to POST to /submit - we handle submissions automatically.
+
+IMAGE/OCR EXAMPLES:
+✅ "Extract number from image" → CALL download_file, THEN analyze_image with task="ocr"
+✅ "Read text from image" → CALL download_file, THEN analyze_image with task="ocr"
 
 DATA ANALYSIS EXAMPLES:
 ✅ "Sum numbers in data.csv" → CALL parse_csv, THEN calculate_statistics with stats=["sum"]
@@ -97,11 +102,43 @@ SCRAPING EXAMPLES:
     has_video = len(page_data.get('video_sources', [])) > 0
     has_images = len(page_data.get('image_sources', [])) > 0
     
+    logger.info(f"[MULTIMODAL_DETECTION] has_images={has_images}, has_audio={has_audio}, has_csv={has_csv_link}")
+    logger.info(f"[PAGE_TEXT_CHECK] Text: {page_data['text'][:300]}")
+    
     data_hint = ""
     tool_choice_mode = "auto"
     
+    # Check for images with OCR requirements
+    if has_images and any(kw in page_text_lower for kw in ['ocr', 'read', 'extract', 'number', 'text', 'image']):
+        image_url = page_data['image_sources'][0]
+        logger.info(f"[IMAGE_DETECTED] Page has image source: {image_url}")
+        logger.info(f"[PAGE_TEXT] Full text: {page_data['text']}")
+        
+        tool_choice_mode = "required"
+        data_hint = f"""
+
+🚨 CRITICAL INSTRUCTION - IMAGE OCR TASK 🚨
+
+The page contains an IMAGE file: {image_url}
+
+You MUST call these tools in your SINGLE response:
+
+1. download_file
+   Arguments: {{"url": "{image_url}"}}
+   This downloads the image and returns {{"path": "...", "size": ..., "content_type": "image/png"}}
+
+2. analyze_image
+   Arguments: {{"image_path": "image_data", "task": "ocr"}}
+   Use artifact key "image_data" to reference the downloaded image
+   The analyze_image tool will perform OCR to extract text/numbers from the image
+
+IMPORTANT: 
+- Use analyze_image for OCR, NOT call_llm (call_llm cannot process images)
+- Reference the downloaded image artifact by its key ("image_data"), not the path
+- The task parameter should be "ocr" for extracting text/numbers
+"""
     # Check for multimedia first - audio often contains instructions
-    if has_audio:
+    elif has_audio:
         audio_url = page_data['audio_sources'][0]
         logger.info(f"[AUDIO_DETECTED] Page has audio source: {audio_url}")
         logger.info(f"[PAGE_TEXT] Full text: {page_data['text']}")
@@ -180,10 +217,11 @@ IMPORTANT: If the quiz requires data analysis (sum, filter, count, etc.), you mu
 
 DECISION TREE:
 1. Does the page say the answer can be "anything" or "any value"? → NO TOOLS, just respond with any string
-2. Does the page ask to analyze/sum/filter data AND there's a CSV/data file? → CALL parse_csv + calculate_statistics
-3. Does the page have links you need to visit (HTML pages)? → CALL render_js_page for each link
-4. Does the page require computation, calculation, or reasoning to answer? → CALL call_llm with the question
-5. Is the answer a literal value already visible on the page? → NO TOOLS, respond with the answer
+2. Does the page have an image that needs OCR? → CALL download_file + analyze_image with task="ocr"
+3. Does the page ask to analyze/sum/filter data AND there's a CSV/data file? → CALL parse_csv + calculate_statistics
+4. Does the page have links you need to visit (HTML pages)? → CALL render_js_page for each link
+5. Does the page require computation, calculation, or reasoning to answer? → CALL call_llm with the question
+6. Is the answer a literal value already visible on the page? → NO TOOLS, respond with the answer
 
 Remember: Call ALL tools needed in ONE response. We can execute multiple tools in sequence.
 """
@@ -300,6 +338,43 @@ Remember: Call ALL tools needed in ONE response. We can execute multiple tools i
 async def call_llm_for_plan(page_data: Dict[str, Any], previous_attempts: List[Any] = None) -> str:
     """Generate execution plan using LLM with correct schema and previous attempt context"""
     
+    # Check for multimodal content
+    page_text_lower = page_data.get('text', '').lower()
+    image_sources = page_data.get('image_sources', [])
+    audio_sources = page_data.get('audio_sources', [])
+    links = page_data.get('links', [])
+    
+    has_images = len(image_sources) > 0
+    has_audio = len(audio_sources) > 0
+    has_csv = any('.csv' in str(link).lower() for link in links)
+    
+    logger.info(f"[PLAN_MULTIMODAL] has_images={has_images}, has_audio={has_audio}, has_csv={has_csv}")
+    logger.info(f"[PLAN_MULTIMODAL] image_sources={image_sources}, audio_sources={audio_sources}")
+    
+    # Build multimodal hints
+    multimodal_hint = ""
+    if has_images and any(kw in page_text_lower for kw in ['ocr', 'read', 'extract', 'number', 'text', 'image']):
+        image_url = image_sources[0]
+        logger.info(f"[PLAN_IMAGE_DETECTED] Image: {image_url}")
+        multimodal_hint = f"""
+
+🖼️ IMAGE OCR DETECTED:
+The page has an image: {image_url}
+For OCR tasks, use:
+1. download_file to get the image
+2. analyze_image with task="ocr" to extract text/numbers
+Do NOT use call_llm for image analysis - it cannot process images!
+"""
+    elif has_audio:
+        audio_url = audio_sources[0]
+        logger.info(f"[PLAN_AUDIO_DETECTED] Audio: {audio_url}")
+        multimodal_hint = f"""
+
+🎵 AUDIO DETECTED:
+The page has audio: {audio_url}
+Use download_file + transcribe_audio to get instructions from the audio.
+"""
+    
     # Build context from previous attempts
     previous_context = ""
     if previous_attempts and len(previous_attempts) > 0:
@@ -370,32 +445,7 @@ WHEN TOOLS ARE NEEDED:
 - Create task objects that produce artifacts
 - Set final_answer_spec.from to reference an artifact key (e.g., "csv_data", "llm_result_1")
 
-
-AVAILABLE TOOLS:
-- render_js_page(url): Render page and get text/links/code
-- fetch_text(url): Fetch text content
-- download_file(url): Download binary file
-- parse_csv(path OR url): Parse CSV from local path or URL → produces {"dataframe_key": "df_0", ...}
-- parse_excel/parse_json_file/parse_html_tables/parse_pdf_tables: Parse files
-- extract_patterns(text, pattern_type, custom_pattern): Extract patterns from text using regex
-  * pattern_type: "email", "url", "phone", "date", "number", "custom"
-  * Returns: {"matches": [list], "count": N, "pattern_type": type}
-- dataframe_ops(op, params): DataFrame operations (filter, sum, mean, count, etc.)
-  * params MUST include "dataframe_key" (e.g., "df_0" from parse_csv)
-  * Filter operations create a NEW dataframe with a new key (e.g., "df_1")
-- train_linear_regression(dataframe_key, feature_columns, target_column, predict_x): Train sklearn linear regression model
-  * dataframe_key: "df_0" (from parse_csv)
-  * feature_columns: ["x"] (list of X column names)
-  * target_column: "y" (Y column name)
-  * predict_x: {"x": 50.0} (optional - values to predict for)
-  * Returns: {"coefficients": [...], "intercept": N, "r2_score": N, "prediction": N}
-- calculate_statistics(dataframe, stats, columns): Calculate statistical measures
-  * stats: ["sum", "mean", "median", "std", "min", "max", "count"]
-- make_plot(spec): Create charts/visualizations
-- zip_base64(paths): Create zip archive from file paths
-- call_llm(prompt, system_prompt, max_tokens, temperature): Call LLM for text analysis/extraction
-  * To reference artifacts in the prompt, use {{artifact_name}} or {artifact_name}
-  * Example: "Find max price in this data: {{json_data}}"
+{get_tool_usage_examples()}
 
 CRITICAL ARTIFACT REFERENCE RULES:
 - parse_csv creates artifact containing {"dataframe_key": "df_0"}
@@ -417,12 +467,13 @@ Text: {page_data['text']}
 Code blocks: {page_data['code_blocks']}
 Links: {page_data['links']}
 Audio sources: {page_data.get('audio_sources', [])}
-HTML preview: {page_data['html'][:500]}...{previous_context}
+Image sources: {page_data.get('image_sources', [])}
+HTML preview: {page_data['html'][:500]}...{multimodal_hint}{previous_context}
 
 ANALYZE THIS QUIZ AND GENERATE THE EXECUTION PLAN JSON.
 
 Requirements:
-1. Find the submit URL (look for POST endpoint, /submit, /answer paths)
+1. Extract the submit URL from the page text (look for "submit to:", "POST to:", etc.)
 2. Identify what answer is required (read the instruction text)
 3. IF AUDIO IS PRESENT: Add tasks to download and transcribe it FIRST to get instructions
 4. Determine the answer type (boolean, number, string, json)
