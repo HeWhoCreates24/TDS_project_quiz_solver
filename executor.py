@@ -14,9 +14,9 @@ from dotenv import load_dotenv
 # Import from refactored modules
 from tool_executors import (
     dataframe_registry, get_secret, extract_json_from_markdown,
-    render_page, fetch_text, download_file, parse_csv, parse_excel,
+    render_page, fetch_text, download_file, parse_csv_async, parse_excel,
     parse_json_file, parse_html_tables, parse_pdf_tables,
-    dataframe_ops, make_plot, zip_base64, answer_submit
+    dataframe_ops, make_plot, zip_base64, answer_submit, extract_patterns
 )
 from llm_client import call_llm, call_llm_with_tools, call_llm_for_plan
 from completion_checker import check_plan_completion, format_artifact, log_completion_stats
@@ -146,6 +146,37 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                         logger.info(f"Executing task {task_id}: {tool_name}")
                         
                         try:
+                            # GENERIC INFRASTRUCTURE: Resolve {{artifact}} references in ALL tool inputs
+                            # This is a fallback - prompts should teach LLM to avoid this pattern
+                            resolved_inputs = {}
+                            for input_key, input_value in inputs.items():
+                                if isinstance(input_value, str) and ('{{' in input_value or (input_value.startswith('{') and input_value.endswith('}') and ' ' not in input_value)):
+                                    # Extract artifact name from {{artifact_name}} or {artifact_name}
+                                    artifact_ref = input_value.strip('{}').strip()
+                                    if artifact_ref in artifacts:
+                                        artifact_data = artifacts[artifact_ref]
+                                        # Extract content from dict artifacts
+                                        if isinstance(artifact_data, dict):
+                                            if 'content' in artifact_data:
+                                                resolved_inputs[input_key] = artifact_data['content']
+                                            elif 'text' in artifact_data:
+                                                resolved_inputs[input_key] = artifact_data['text']
+                                            elif 'dataframe_key' in artifact_data:
+                                                # Extract dataframe_key for dataframe operations
+                                                resolved_inputs[input_key] = artifact_data['dataframe_key']
+                                            else:
+                                                resolved_inputs[input_key] = artifact_data
+                                        else:
+                                            resolved_inputs[input_key] = artifact_data
+                                        logger.info(f"[ARTIFACT_RESOLVE] Resolved {{{{{artifact_ref}}}}} in {tool_name}.{input_key}")
+                                    else:
+                                        resolved_inputs[input_key] = input_value
+                                else:
+                                    resolved_inputs[input_key] = input_value
+                            
+                            # Use resolved inputs
+                            inputs = resolved_inputs
+                            
                             # Tool execution routing
                             if tool_name == "render_js_page":
                                 logger.info(f"[TOOL_EXEC] {task_id}: render_js_page - URL: {inputs['url']}")
@@ -172,10 +203,12 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 result = await MultimediaTools.transcribe_audio(audio_path)
                                 logger.info(f"[TOOL_RESULT] {task_id}: transcribe_audio - Text: {result.get('text', '')[:200]}...")
                             elif tool_name == "parse_csv":
-                                result = parse_csv(
+                                logger.info(f"[TOOL_EXEC] {task_id}: parse_csv - Path: {inputs.get('path')}, URL: {inputs.get('url')}")
+                                result = await parse_csv_async(
                                     path=inputs.get("path"),
                                     url=inputs.get("url")
                                 )
+                                logger.info(f"[TOOL_RESULT] {task_id}: parse_csv - DataFrame: {result.get('dataframe_key')}, Shape: {result.get('shape')}")
                             elif tool_name == "parse_excel":
                                 result = parse_excel(inputs["path"])
                             elif tool_name == "parse_json_file":
@@ -184,8 +217,30 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 result = parse_html_tables(inputs["path_or_html"])
                             elif tool_name == "parse_pdf_tables":
                                 result = parse_pdf_tables(inputs["path"], inputs.get("pages", "all"))
+                            elif tool_name == "extract_patterns":
+                                logger.info(f"[TOOL_EXEC] {task_id}: extract_patterns - Pattern: {inputs.get('pattern_type')}")
+                                text = inputs["text"]
+                                # Resolve artifact reference
+                                if isinstance(text, str) and text in artifacts:
+                                    text = artifacts[text]
+                                result = extract_patterns(
+                                    text=text,
+                                    pattern_type=inputs["pattern_type"],
+                                    custom_pattern=inputs.get("custom_pattern")
+                                )
+                                logger.info(f"[TOOL_RESULT] {task_id}: extract_patterns - Found {result.get('count')} matches")
                             elif tool_name == "dataframe_ops":
-                                result = dataframe_ops(inputs["op"], inputs.get("params", {}))
+                                # Resolve dataframe_key if it's an artifact reference
+                                params = inputs.get("params", {})
+                                df_key = params.get("dataframe_key")
+                                
+                                # If df_key is an artifact name, resolve it to the actual dataframe_key
+                                if df_key and df_key in artifacts:
+                                    artifact = artifacts[df_key]
+                                    if isinstance(artifact, dict) and "dataframe_key" in artifact:
+                                        params["dataframe_key"] = artifact["dataframe_key"]
+                                
+                                result = dataframe_ops(inputs["op"], params)
                             elif tool_name == "make_plot":
                                 result = make_plot(inputs["spec"])
                             elif tool_name == "zip_base64":
@@ -321,6 +376,14 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 df = inputs["dataframe"]
                                 result = AnalysisTools.apply_ml_model(df, inputs["model_type"], **inputs.get("kwargs", {}))
                                 result = {"model_result": result}
+                            elif tool_name == "train_linear_regression":
+                                result = AnalysisTools.train_linear_regression(
+                                    dataframe_key=inputs["dataframe_key"],
+                                    feature_columns=inputs["feature_columns"],
+                                    target_column=inputs["target_column"],
+                                    predict_x=inputs.get("predict_x")
+                                )
+                                logger.info(f"[TOOL_RESULT] {task_id}: train_linear_regression - R²={result.get('r2_score', 'N/A')}, Prediction={result.get('prediction', 'N/A')}")
                             elif tool_name == "geospatial_analysis":
                                 df = inputs.get("dataframe")
                                 result = AnalysisTools.geospatial_analysis(df, inputs["analysis_type"], **inputs.get("kwargs", {}))
@@ -465,92 +528,148 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
         # Extract final answer
         final_answer = None
         final_spec = plan.get("final_answer_spec", {})
+        page_text = page_data.get('text', '') if page_data else ''
         
         logger.info("Preparing final answer for submission")
         
-        # Get the plan's specified artifact key
-        from_key = final_spec.get("from", "")
+        # Collect ALL candidate artifacts (not just one)
         candidate_artifacts = {}
-        alternative_artifact = None  # Cache for PRIORITY 3
         
-        # Single pass through artifacts - check all priorities at once
-        for key in sorted(artifacts.keys(), reverse=True):
+        # Gather all potentially useful artifacts
+        for key in artifacts.keys():
             value = artifacts[key]
             
-            # PRIORITY 1: Statistics results (highest priority)
+            # Skip internal tracking artifacts
+            if key.startswith('_'):
+                continue
+            
+            # Include statistics results
             if isinstance(value, dict) and 'statistics' in value:
-                logger.info(f"[ARTIFACT_SELECTION] Found statistics result (HIGHEST PRIORITY): {key}")
-                candidate_artifacts = {key: value}
-                break  # Statistics found - stop searching
+                candidate_artifacts[key] = value
+                continue
             
-            # PRIORITY 3: Cache first good alternative (only if no statistics found yet)
-            if not alternative_artifact:
-                # Check string artifacts
-                if isinstance(value, str) and len(value) < 500 and len(value) > 2:
-                    if not ('<' in value or 'script' in value.lower()):
-                        prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_')
-                        if any(key.startswith(p) for p in prefixes):
-                            alternative_artifact = (key, value)
-                # Check dict artifacts with 'text' field (e.g., rendered_page_X)
-                elif isinstance(value, dict) and 'text' in value:
-                    text_content = value.get('text', '')
-                    if isinstance(text_content, str) and len(text_content.strip()) > 5:
-                        if not ('<' in text_content or 'script' in text_content.lower()):
-                            prefixes = ('rendered_', 'scraped_', 'extracted_', 'result_')
-                            if any(key.startswith(p) for p in prefixes):
-                                alternative_artifact = (key, value)
-        
-        # PRIORITY 2: If no statistics, try the specified artifact
-        if not candidate_artifacts and from_key:
-            cleaned_key = from_key.strip()
-            cleaned_key = re.sub(r"^static value\s*['\"]?|['\"]?$", "", cleaned_key)
-            cleaned_key = re.sub(r"^['\"]|['\"]$", "", cleaned_key).strip()
+            # Include successful transcription artifacts
+            if isinstance(value, dict) and value.get('success') and 'text' in value:
+                if 'audio_path' in value or 'method' in value or key.startswith('transcribe'):
+                    candidate_artifacts[key] = value
+                    continue
             
-            if from_key in artifacts:
-                value = artifacts[from_key]
-                # Check if it's useful (not HTML/script)
-                is_useless = False
-                if isinstance(value, str) and ('<' in value or 'script' in value.lower()):
-                    is_useless = True
-                elif isinstance(value, dict) and 'content' in value:
-                    # Dict with 'content' field that has HTML
-                    content = value.get('content', '')
-                    if isinstance(content, str) and ('<' in content or 'script' in content.lower()):
-                        is_useless = True
-                
-                if not is_useless:
-                    candidate_artifacts[from_key] = value
-            elif cleaned_key in artifacts:
-                value = artifacts[cleaned_key]
-                # Same checks for cleaned key
-                is_useless = False
-                if isinstance(value, str) and ('<' in value or 'script' in value.lower()):
-                    is_useless = True
-                elif isinstance(value, dict) and 'content' in value:
-                    content = value.get('content', '')
-                    if isinstance(content, str) and ('<' in content or 'script' in content.lower()):
-                        is_useless = True
-                
-                if not is_useless:
-                    candidate_artifacts[cleaned_key] = value
+            # Include pattern extraction results
+            if isinstance(value, dict) and 'pattern_type' in value and 'count' in value:
+                candidate_artifacts[key] = value
+                continue
+            
+            # Include vision results
+            if isinstance(value, dict) and ('vision_result' in value or 'ocr_text' in value):
+                candidate_artifacts[key] = value
+                continue
+            
+            # Include dataframe operation results
+            if isinstance(value, dict) and 'result' in value and 'type' in value:
+                candidate_artifacts[key] = value
+                continue
+            
+            # Include chart/plot paths
+            if isinstance(value, dict) and ('chart_path' in value or 'plot_path' in value):
+                candidate_artifacts[key] = value
+                continue
+            
+            # Include reasonable string artifacts (not HTML/scripts)
+            if isinstance(value, str) and len(value) < 500 and len(value) > 2:
+                if not ('<' in value or 'script' in value.lower()):
+                    prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_', 'transcription_')
+                    if any(key.startswith(p) for p in prefixes):
+                        candidate_artifacts[key] = value
+                        continue
+            
+            # Include dict artifacts with 'text' field (e.g., rendered pages)
+            if isinstance(value, dict) and 'text' in value:
+                text_content = value.get('text', '')
+                if isinstance(text_content, str) and len(text_content.strip()) > 5:
+                    if not ('<' in text_content or 'script' in text_content.lower()):
+                        candidate_artifacts[key] = value
+                        continue
         
-        # PRIORITY 3: Use cached alternative if plan's artifact wasn't useful
-        if not candidate_artifacts and alternative_artifact:
-            key, value = alternative_artifact
-            # Safe logging for both string and dict values
-            log_value = str(value)[:100] if isinstance(value, dict) else value[:100]
-            logger.info(f"[ARTIFACT_SELECTION] Using alternative: {key} = {log_value}")
-            candidate_artifacts[key] = value
-        
-        # Select best artifact
-        if candidate_artifacts:
-            # Prefer most recently created/processed artifact (last in dict)
-            final_answer = list(candidate_artifacts.values())[-1]
-            selected_key = list(candidate_artifacts.keys())[-1]
-            logger.info(f"Final answer extracted from artifact '{selected_key}'")
-        elif from_key:
-            logger.info(f"Artifact '{from_key}' not found, using as literal answer: {from_key}")
-            final_answer = cleaned_key
+        # If we have multiple candidates, ask LLM to choose the correct one
+        if len(candidate_artifacts) > 1:
+            logger.info(f"[ARTIFACT_SELECTION] Found {len(candidate_artifacts)} candidate artifacts - asking LLM to select")
+            
+            # Prepare artifact summaries for LLM
+            artifact_summaries = {}
+            for key, value in candidate_artifacts.items():
+                if isinstance(value, dict):
+                    # For dicts, show structure
+                    if 'text' in value:
+                        artifact_summaries[key] = f"Dict with 'text': {str(value['text'])[:100]}..."
+                    elif 'statistics' in value:
+                        artifact_summaries[key] = f"Statistics result: {value}"
+                    elif 'count' in value and 'pattern_type' in value:
+                        artifact_summaries[key] = f"Pattern extraction: {value['pattern_type']} (count={value['count']})"
+                    elif 'success' in value and 'audio_path' in value:
+                        artifact_summaries[key] = f"Transcription: {value.get('text', '')}"
+                    else:
+                        artifact_summaries[key] = f"Dict: {str(value)[:100]}..."
+                else:
+                    artifact_summaries[key] = f"String: {str(value)[:100]}..."
+            
+            # Ask LLM which artifact contains the answer
+            selection_prompt = f"""You have multiple artifacts that could contain the answer to this question:
+
+Question: {page_text}
+
+Available artifacts:
+{json.dumps(artifact_summaries, indent=2)}
+
+Which artifact key contains the actual answer to the question? Respond with ONLY the artifact key name, nothing else."""
+
+            try:
+                selection_response = await call_llm(
+                    prompt=selection_prompt,
+                    system_prompt="You are selecting the correct artifact. Respond with ONLY the artifact key name."
+                )
+                selected_key = selection_response.strip()
+                
+                # Validate the selection
+                if selected_key in candidate_artifacts:
+                    logger.info(f"[ARTIFACT_SELECTION] LLM selected: {selected_key}")
+                    final_answer = candidate_artifacts[selected_key]
+                else:
+                    # Fallback: use most recent
+                    logger.warning(f"[ARTIFACT_SELECTION] LLM selected invalid key '{selected_key}', using most recent")
+                    final_answer = list(candidate_artifacts.values())[-1]
+                    selected_key = list(candidate_artifacts.keys())[-1]
+            except Exception as e:
+                logger.error(f"[ARTIFACT_SELECTION] LLM selection failed: {e}, using most recent")
+                final_answer = list(candidate_artifacts.values())[-1]
+                selected_key = list(candidate_artifacts.keys())[-1]
+        elif len(candidate_artifacts) == 1:
+            # Only one candidate - use it
+            final_answer = list(candidate_artifacts.values())[0]
+            selected_key = list(candidate_artifacts.keys())[0]
+            logger.info(f"[ARTIFACT_SELECTION] Single candidate: {selected_key}")
+        else:
+            # No candidates found - check if plan specified an artifact
+            from_key = final_spec.get("from", "")
+            if from_key:
+                logger.warning(f"[ARTIFACT_SELECTION] No candidates found, trying plan-specified '{from_key}'")
+                cleaned_key = from_key.strip()
+                cleaned_key = re.sub(r"^static value\s*['\"]?|['\"]?$", "", cleaned_key)
+                cleaned_key = re.sub(r"^['\"]|['\"]$", "", cleaned_key).strip()
+                
+                if from_key in artifacts:
+                    final_answer = artifacts[from_key]
+                    selected_key = from_key
+                elif cleaned_key in artifacts:
+                    final_answer = artifacts[cleaned_key]
+                    selected_key = cleaned_key
+                else:
+                    logger.warning(f"[ARTIFACT_SELECTION] '{from_key}' not found, using as literal")
+                    final_answer = cleaned_key
+                    selected_key = "literal"
+            else:
+                logger.error("[ARTIFACT_SELECTION] No candidates and no plan-specified artifact!")
+                final_answer = None
+                selected_key = "none"
         
         # Handle dict objects and string representations of dicts
         if isinstance(final_answer, dict):
@@ -587,6 +706,20 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             else:
                                 final_answer = next(iter(col_stats.values()))
             
+            # Handle extract_patterns result format: {'matches': [...], 'count': N, 'pattern_type': 'email'}
+            if isinstance(final_answer, dict) and 'pattern_type' in final_answer and 'count' in final_answer:
+                logger.info(f"[ARTIFACT_EXTRACTION] Detected extract_patterns result: {final_answer}")
+                # Extract just the count for "how many" questions
+                final_answer = final_answer['count']
+                logger.info(f"[ARTIFACT_EXTRACTION] Extracted count: {final_answer}")
+            
+            # Handle train_linear_regression result format: {'prediction': value, 'coefficients': [...], ...}
+            if isinstance(final_answer, dict) and 'prediction' in final_answer and 'model_type' in final_answer:
+                logger.info(f"[ARTIFACT_EXTRACTION] Detected train_linear_regression result: {final_answer}")
+                # Extract just the prediction value
+                final_answer = final_answer['prediction']
+                logger.info(f"[ARTIFACT_EXTRACTION] Extracted prediction: {final_answer}")
+            
             # Handle dataframe_ops result format: {'result': value, 'type': 'typename'}
             if isinstance(final_answer, dict) and 'result' in final_answer and 'type' in final_answer:
                 result_value = final_answer['result']
@@ -600,6 +733,23 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                 logger.info(f"[ARTIFACT_EXTRACTION] Extracting 'text' from dict object")
                 final_answer = final_answer['text']
                 logger.info(f"[ARTIFACT_EXTRACTION] Extracted: {str(final_answer)[:100]}...")
+        
+        # Extract secret code/value from rendered text patterns
+        if isinstance(final_answer, str):
+            import re
+            # Pattern: "The secret code is: 9876" or "Secret code is 1371" etc.
+            secret_patterns = [
+                r'(?:secret code|code|answer|value)\s*(?:is|:)\s*[:\-]?\s*(\d+)',
+                r'(?:secret code|code|answer|value)\s*[:\-]\s*[:\-]?\s*(\S+)',
+            ]
+            for pattern in secret_patterns:
+                match = re.search(pattern, final_answer, re.IGNORECASE)
+                if match:
+                    extracted_value = match.group(1)
+                    logger.info(f"[ARTIFACT_EXTRACTION] Detected secret code pattern, extracting: {extracted_value}")
+                    final_answer = extracted_value
+                    break
+        
         elif isinstance(final_answer, str) and (final_answer.startswith("{'") or final_answer.startswith('{"')):
             # String representation of a dict - try to extract 'text'
             logger.info(f"[ARTIFACT_EXTRACTION] Detected string dict representation, extracting 'text'...")

@@ -146,20 +146,27 @@ async def download_file(url: str) -> Dict[str, Any]:
         raise
 
 
-def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
-    """Parse CSV file from path or URL"""
+async def parse_csv_async(path: str = None, url: str = None) -> Dict[str, Any]:
+    """Parse CSV file from path or URL (async version)"""
     try:
-        # If URL is provided, use it directly
-        source = url if url else path
-        if not source:
+        # Determine source
+        if not path and not url:
             raise ValueError("Either path or url must be provided")
         
-        # Cache miss - parse CSV (we'll optimize caching later)
-        # For now, skip caching parse_csv to avoid dataframe registry issues
+        # Cache miss - parse CSV
         quiz_cache.record_miss()
         
+        # If URL, fetch content asynchronously
+        if url:
+            from io import StringIO
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=30.0, follow_redirects=True)
+                response.raise_for_status()
+                source = StringIO(response.text)
+        else:
+            source = path
+        
         # Try reading first to detect if it has headers
-        # Read a sample to check if first row looks like data or headers
         sample_df = pd.read_csv(source, nrows=5)
         
         # Heuristic: If the first row (column names) are all numeric, likely no header
@@ -169,6 +176,14 @@ def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
             has_header = False
         except:
             has_header = True
+        
+        # Reset source for full read if it's from URL
+        if url:
+            from io import StringIO
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=30.0, follow_redirects=True)
+                response.raise_for_status()
+                source = StringIO(response.text)
         
         # Read the full CSV with appropriate header setting
         if has_header:
@@ -188,11 +203,16 @@ def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
             "sample": df.head().to_dict()
         }
         
-        # Skip caching for now (dataframe registry restoration is complex)
         return result
     except Exception as e:
-        logger.error(f"Error parsing CSV from {source}: {e}")
+        logger.error(f"Error parsing CSV from {url or path}: {e}")
         raise
+
+
+def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
+    """Parse CSV file from path or URL (sync wrapper)"""
+    import asyncio
+    return asyncio.run(parse_csv_async(path, url))
 
 
 def parse_excel(path: str) -> Dict[str, Any]:
@@ -249,16 +269,117 @@ def parse_html_tables(html_content: str) -> Dict[str, Any]:
 
 
 def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
-    """Parse PDF tables (placeholder)"""
+    """Parse PDF tables and store in dataframe registry"""
     try:
+        import pdfplumber
+        
+        # Handle dict input from download_file artifact
+        if isinstance(path, dict):
+            path = path.get('path', path)
+        
+        all_tables = []
+        with pdfplumber.open(path) as pdf:
+            page_list = range(len(pdf.pages)) if pages == "all" else [int(p) - 1 for p in pages.split(",")]
+            
+            for page_num in page_list:
+                if page_num < len(pdf.pages):
+                    page = pdf.pages[page_num]
+                    tables = page.extract_tables()
+                    all_tables.extend(tables)
+        
+        if not all_tables:
+            logger.warning(f"No tables found in PDF {path}")
+            return {"dataframe_key": None, "tables_found": 0}
+        
+        # Convert first table to dataframe
+        df = pd.DataFrame(all_tables[0][1:], columns=all_tables[0][0])
+        
+        # Convert numeric columns from strings to numbers
+        for col in df.columns:
+            try:
+                df[col] = pd.to_numeric(df[col])
+            except (ValueError, TypeError):
+                # Keep as string if conversion fails
+                pass
+        
+        df_key = f"df_{len(dataframe_registry)}"
+        dataframe_registry[df_key] = df
+        
+        logger.info(f"[PDF_PARSE] Extracted {len(all_tables)} table(s), registered as {df_key}")
+        
         return {
-            "warning": "PDF parsing requires pdfplumber installation",
-            "path": path,
-            "pages": pages
+            "dataframe_key": df_key,
+            "tables_found": len(all_tables),
+            "shape": df.shape,
+            "columns": list(df.columns),
+            "sample": df.head(3).to_dict()
         }
+    except ImportError:
+        logger.error("pdfplumber not installed - cannot parse PDF tables")
+        raise ImportError("Please install pdfplumber: pip install pdfplumber")
     except Exception as e:
         logger.error(f"Error parsing PDF {path}: {e}")
         raise
+
+
+def extract_patterns(text: str, pattern_type: str, custom_pattern: str = None) -> Dict[str, Any]:
+    """
+    Extract patterns from text using regex
+    
+    Args:
+        text: Text to extract from (can be dict with 'content' key or raw string)
+        pattern_type: Type of pattern - "email", "url", "phone", "date", "number", "custom"
+        custom_pattern: Custom regex pattern if pattern_type is "custom"
+    
+    Returns:
+        Dict with "matches" (list of found patterns) and "count" (unique count)
+    """
+    import re
+    
+    # Handle dict input (from fetch_text artifact)
+    if isinstance(text, dict):
+        text = text.get('content', str(text))
+    
+    text = str(text)
+    
+    # Define common patterns
+    patterns = {
+        "email": r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        "url": r'https?://[^\s]+',
+        "phone": r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b',
+        "date": r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
+        "number": r'\b\d+\.?\d*\b',
+    }
+    
+    if pattern_type == "custom":
+        if not custom_pattern:
+            raise ValueError("custom_pattern required when pattern_type='custom'")
+        pattern = custom_pattern
+    elif pattern_type in patterns:
+        pattern = patterns[pattern_type]
+    else:
+        raise ValueError(f"Unknown pattern_type: {pattern_type}. Use: {list(patterns.keys())} or 'custom'")
+    
+    # Find all matches
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    
+    # Get unique matches (preserve order)
+    seen = set()
+    unique_matches = []
+    for match in matches:
+        match_lower = match.lower()
+        if match_lower not in seen:
+            seen.add(match_lower)
+            unique_matches.append(match)
+    
+    result = {
+        "matches": unique_matches,
+        "count": len(unique_matches),
+        "pattern_type": pattern_type
+    }
+    
+    logger.info(f"[TOOL_RESULT] extract_patterns - Found {len(unique_matches)} unique {pattern_type}(s)")
+    return result
 
 
 def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -268,7 +389,7 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
     # Thread-safe registry read - copy to avoid race conditions during filtering
     with _dataframe_lock:
         if df_key not in dataframe_registry:
-            raise ValueError(f"DataFrame {df_key} not found in registry")
+            raise ValueError(f"DataFrame {df_key} not found in registry. Available: {list(dataframe_registry.keys())}")
         df = dataframe_registry[df_key].copy()
     
     result = None
@@ -280,68 +401,99 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         condition = params.get("condition")
         if condition:
             try:
-                # Parse condition: "column op value" or "value op column"
-                # Support both orders: "96903 >= 1371" and "column >= value"
-                parts = condition.split()
-                if len(parts) >= 3:
-                    # Try parsing as "column op value"
-                    col_name = parts[0]
-                    operator = parts[1]
-                    value_str = " ".join(parts[2:])
+                # Handle dict format: {'column': 'name', 'operator': '>=', 'value': 100}
+                if isinstance(condition, dict):
+                    col = condition.get('column')
+                    op_str = condition.get('operator')
+                    val = condition.get('value')
                     
-                    # Check if first part is a column name (handle both string and int column names)
-                    col_name_normalized = col_name
+                    # Validate column exists
+                    if col not in df.columns:
+                        raise ValueError(f"Column '{col}' not found. Available columns: {list(df.columns)}")
+                    
+                    # Direct execution with dict format - more reliable
                     try:
-                        # Try converting to int for numeric column names
-                        col_name_normalized = int(col_name)
-                    except (ValueError, TypeError):
-                        pass
+                        value = pd.to_numeric(val)
+                    except:
+                        value = str(val).strip("'\"")
                     
-                    if col_name_normalized in df.columns:
-                        # Normal order: column op value
-                        try:
-                            value = pd.to_numeric(value_str)
-                        except:
-                            value = value_str.strip("'\"")
-                        
-                        if operator == ">=":
-                            result = df[df[col_name_normalized] >= value]
-                        elif operator == "<=":
-                            result = df[df[col_name_normalized] <= value]
-                        elif operator == ">":
-                            result = df[df[col_name_normalized] > value]
-                        elif operator == "<":
-                            result = df[df[col_name_normalized] < value]
-                        elif operator == "==":
-                            result = df[df[col_name_normalized] == value]
-                        elif operator == "!=":
-                            result = df[df[col_name_normalized] != value]
+                    if op_str == ">=":
+                        result = df[df[col] >= value]
+                    elif op_str == "<=":
+                        result = df[df[col] <= value]
+                    elif op_str == ">":
+                        result = df[df[col] > value]
+                    elif op_str == "<":
+                        result = df[df[col] < value]
+                    elif op_str == "==":
+                        result = df[df[col] == value]
+                    elif op_str == "!=":
+                        result = df[df[col] != value]
                     else:
-                        # Reversed order: value op column
-                        # Need to find the column (should be last part)
-                        col_name = parts[-1]
-                        value_str = parts[0]
-                        
-                        try:
-                            value = pd.to_numeric(value_str)
-                        except:
-                            value = value_str.strip("'\"")
-                        
-                        # Reverse the operator
-                        if operator == ">=":
-                            result = df[df[col_name] <= value]  # a >= b means b <= a
-                        elif operator == "<=":
-                            result = df[df[col_name] >= value]
-                        elif operator == ">":
-                            result = df[df[col_name] < value]
-                        elif operator == "<":
-                            result = df[df[col_name] > value]
-                        elif operator == "==":
-                            result = df[df[col_name] == value]
-                        elif operator == "!=":
-                            result = df[df[col_name] != value]
+                        raise ValueError(f"Unsupported operator: {op_str}")
                 else:
-                    raise ValueError(f"Invalid condition format: {condition}")
+                    # Parse string condition: "column op value" or "value op column"
+                    # Support both orders: "96903 >= 1371" and "column >= value"
+                    parts = condition.split()
+                    if len(parts) >= 3:
+                        # Try parsing as "column op value"
+                        col_name = parts[0]
+                        operator = parts[1]
+                        value_str = " ".join(parts[2:])
+                        
+                        # Check if first part is a column name (handle both string and int column names)
+                        col_name_normalized = col_name
+                        try:
+                            # Try converting to int for numeric column names
+                            col_name_normalized = int(col_name)
+                        except (ValueError, TypeError):
+                            pass
+                        
+                        if col_name_normalized in df.columns:
+                            # Normal order: column op value
+                            try:
+                                value = pd.to_numeric(value_str)
+                            except:
+                                value = value_str.strip("'\"")
+                            
+                            if operator == ">=":
+                                result = df[df[col_name_normalized] >= value]
+                            elif operator == "<=":
+                                result = df[df[col_name_normalized] <= value]
+                            elif operator == ">":
+                                result = df[df[col_name_normalized] > value]
+                            elif operator == "<":
+                                result = df[df[col_name_normalized] < value]
+                            elif operator == "==":
+                                result = df[df[col_name_normalized] == value]
+                            elif operator == "!=":
+                                result = df[df[col_name_normalized] != value]
+                        else:
+                            # Reversed order: value op column
+                            # Need to find the column (should be last part)
+                            col_name = parts[-1]
+                            value_str = parts[0]
+                            
+                            try:
+                                value = pd.to_numeric(value_str)
+                            except:
+                                value = value_str.strip("'\"")
+                            
+                            # Reverse the operator
+                            if operator == ">=":
+                                result = df[df[col_name] <= value]  # a >= b means b <= a
+                            elif operator == "<=":
+                                result = df[df[col_name] >= value]
+                            elif operator == ">":
+                                result = df[df[col_name] < value]
+                            elif operator == "<":
+                                result = df[df[col_name] > value]
+                            elif operator == "==":
+                                result = df[df[col_name] == value]
+                            elif operator == "!=":
+                                result = df[df[col_name] != value]
+                    else:
+                        raise ValueError(f"Invalid condition format: {condition}")
             except Exception as e:
                 logger.error(f"Error evaluating condition '{condition}': {e}")
                 raise ValueError(f"Invalid filter condition: {condition}")

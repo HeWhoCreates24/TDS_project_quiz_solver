@@ -83,6 +83,9 @@ async def generate_next_tasks(plan_obj: Dict[str, Any], artifacts: Dict[str, Any
             elif 'vision_result' in value or 'ocr_text' in value:
                 # Keep vision/OCR results full (often contain answer)
                 artifacts_summary[key] = {k: v if k in ['vision_result', 'ocr_text'] else str(v)[:100] for k, v in list(value.items())[:10]}
+            elif 'prediction' in value and 'model_type' in value:
+                # Keep ML prediction results with prediction field visible
+                artifacts_summary[key] = {k: v if k in ['prediction', 'r2_score', 'model_type'] else str(v)[:100] for k, v in list(value.items())[:10]}
             else:
                 artifacts_summary[key] = {k: str(v)[:100] for k, v in list(value.items())[:5]}
         else:
@@ -103,7 +106,14 @@ async def generate_next_tasks(plan_obj: Dict[str, Any], artifacts: Dict[str, Any
     # ========================================
     
     # 1. AUDIO: Force transcription if audio present but not transcribed
-    has_transcription = transcription_text is not None
+    # Check if we already have transcription results in artifacts
+    has_transcription_artifact = any(
+        isinstance(v, dict) and (v.get('success') or 'text' in v) and 
+        ('audio_path' in v or 'method' in v or k.startswith('transcribe'))
+        for k, v in artifacts.items()
+    )
+    has_transcription = transcription_text is not None or has_transcription_artifact
+    
     if not has_transcription:
         has_audio_file = any('content_type' in str(v) and 'audio' in str(v).lower() for v in artifacts.values())
         if has_audio_file:
@@ -215,8 +225,14 @@ Understanding multi-step workflows (GENERALIZED for all data types):
 DATA ANALYSIS workflows:
 - When instructions mention filtering/selecting a subset, FIRST filter, THEN calculate
 - Example: "sum values >= 100" requires TWO steps:
-  1. dataframe_ops(op="filter", params={"dataframe_key": "df_0", "condition": "column >= 100"}) → creates df_1
-  2. calculate_statistics(dataframe="df_1", stats=["sum"]) → calculates sum on filtered data
+  1. dataframe_ops(op="filter", params={"dataframe_key": "df_0", "condition": "column >= 100"}) → produces artifact "filtered_df" containing {"dataframe_key": "df_1"}
+  2. calculate_statistics(dataframe="df_1", stats=["sum"]) → USE THE ACTUAL KEY "df_1", NOT the artifact name
+
+**CRITICAL DATAFRAME REFERENCING:**
+- parse_csv creates dataframe with key "df_0", stored in artifact (e.g., csv_data: {"dataframe_key": "df_0"})
+- dataframe_ops filter creates NEW dataframe with key "df_1", stored in artifact (e.g., filtered_df: {"dataframe_key": "df_1"})
+- When referencing dataframes in subsequent operations, use the ACTUAL KEY ("df_0", "df_1"), NOT the artifact name
+- Check artifact contents to find the actual dataframe_key value to use
 
 VISION/IMAGE workflows:
 - Raw image/PDF → analyze_image or ocr_image → extract text/data → use in calculations

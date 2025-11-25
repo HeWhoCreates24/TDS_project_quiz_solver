@@ -370,6 +370,39 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "train_linear_regression",
+                "description": "Train a sklearn linear regression model and make predictions. Use for machine learning and regression tasks. Returns coefficients, R² score, and optional prediction.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dataframe_key": {
+                            "type": "string",
+                            "description": "DataFrame key from registry (e.g., 'df_0', 'df_1')"
+                        },
+                        "feature_columns": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of column names to use as features/X (e.g., ['x'] or ['feature1', 'feature2'])"
+                        },
+                        "target_column": {
+                            "type": "string",
+                            "description": "Column name to predict/y (e.g., 'y', 'price', 'sales')"
+                        },
+                        "predict_x": {
+                            "type": "object",
+                            "description": "Optional: Feature values to predict for. Keys must match feature_columns. Example: {'x': 50.0}",
+                            "additionalProperties": {
+                                "type": "number"
+                            }
+                        }
+                    },
+                    "required": ["dataframe_key", "feature_columns", "target_column"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "apply_ml_model",
                 "description": "Apply machine learning models (regression, classification, clustering)",
                 "parameters": {
@@ -554,7 +587,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "call_llm",
-                "description": "Call an LLM to analyze data, extract information, or generate content",
+                "description": "Call an LLM to analyze data, extract information, or generate content.",
                 "parameters": {
                     "type": "object",
                     "properties": {

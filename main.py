@@ -14,6 +14,7 @@ from typing import Any, Dict
 
 from models import QuizRun
 from executor import run_pipeline
+from test_quizzes import router as test_router
 
 # Windows compatibility for asyncio
 if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
@@ -22,6 +23,9 @@ if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
 load_dotenv()
 
 app = FastAPI(title="Quiz Solver API")
+
+# Include test quiz router
+app.include_router(test_router)
 
 SECRET = os.getenv("SECRET")
 if not SECRET:
@@ -122,6 +126,11 @@ async def root():
         "endpoints": {
             "POST /solve": "Solve a quiz",
             "GET /health": "Health check",
+            "GET /test-quiz/{quiz_type}": "Get test quiz (literal/compute/web_api/...)",
+            "POST /test-quiz/{quiz_type}/submit": "Submit answer for test quiz",
+            "GET /test-data/{filename}": "Get test data files",
+            "GET /test-api/config": "Mock API endpoint",
+            "GET /test-page/dynamic": "Mock JS-rendered page",
             "GET /": "This endpoint"
         }
     }

@@ -218,6 +218,17 @@ def check_completion_fast(artifacts: Dict[str, Any], page_text: str = "", transc
             # Vision/OCR results with extracted text
             if 'vision_result' in artifact_value or 'ocr_text' in artifact_value:
                 text_result = artifact_value.get('vision_result') or artifact_value.get('ocr_text')
+                if text_result and isinstance(text_result, str) and len(text_result.strip()) > 0:
+                    logger.info(f"[FAST_CHECK] Vision/OCR result found in {artifact_key}")
+                    return {"complete": True, "reason": "vision_result_present"}
+            
+            # Pattern extraction results (extract_patterns output)
+            if 'pattern_type' in artifact_value and 'count' in artifact_value:
+                # Check if page asks for count/number
+                count_keywords = ['how many', 'count', 'number of', 'total']
+                if any(keyword in page_text.lower() for keyword in count_keywords):
+                    logger.info(f"[FAST_CHECK] Pattern extraction count found in {artifact_key}")
+                    return {"complete": True, "reason": "pattern_count_present"}
                 if text_result and isinstance(text_result, str) and len(text_result) > 10:
                     logger.info(f"[FAST_CHECK] Vision/OCR text found in {artifact_key}")
                     return {"complete": True, "reason": "vision_text_present"}
@@ -468,6 +479,14 @@ async def check_plan_completion(
 
 async def format_artifact(artifact_key: str, artifact_value: Any, page_instructions: str) -> Any:
     """Use LLM to extract meaningful information from complex artifacts"""
+    
+    # Handle extract_patterns results - return count when asking for "how many"
+    if isinstance(artifact_value, dict) and 'pattern_type' in artifact_value and 'count' in artifact_value:
+        # Check if question asks for count/number
+        count_keywords = ['how many', 'count', 'number of', 'total']
+        if any(keyword in page_instructions.lower() for keyword in count_keywords):
+            logger.info(f"[ARTIFACT_FORMAT] Extracting count from pattern extraction: {artifact_value['count']}")
+            return artifact_value['count']
     
     # Only process complex artifacts (dicts with HTML/text, long strings)
     should_process = False

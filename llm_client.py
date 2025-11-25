@@ -182,7 +182,8 @@ DECISION TREE:
 1. Does the page say the answer can be "anything" or "any value"? → NO TOOLS, just respond with any string
 2. Does the page ask to analyze/sum/filter data AND there's a CSV/data file? → CALL parse_csv + calculate_statistics
 3. Does the page have links you need to visit (HTML pages)? → CALL render_js_page for each link
-4. Is the answer obvious from the page text? → NO TOOLS, respond with the answer
+4. Does the page require computation, calculation, or reasoning to answer? → CALL call_llm with the question
+5. Is the answer a literal value already visible on the page? → NO TOOLS, respond with the answer
 
 Remember: Call ALL tools needed in ONE response. We can execute multiple tools in sequence.
 """
@@ -352,10 +353,23 @@ DO NOT put actual values like URLs or answer numbers in request_body!
 
 IMPORTANT RULES:
 1. Submit URL must be extracted from the page text
-2. Tasks array contains the work to do (can be empty if answer is direct)
-3. final_answer_spec.from references an artifact key from tasks OR a literal value
+2. Tasks array contains the work to do (can be empty if answer is obvious/direct)
+3. final_answer_spec.from references an artifact key from tasks OR **THE ACTUAL ANSWER VALUE** if no tools needed
 4. request_body MUST be copied exactly as shown in the example above
 5. Return ONLY valid JSON, no markdown wrapper, no extra text
+
+WHEN NO TOOLS ARE NEEDED (answer is obvious or requires simple computation):
+- Set tasks: []
+- Set final_answer_spec.from to THE ACTUAL ANSWER VALUE (not a placeholder)
+- Examples:
+  * Page says "answer is literal_test_value" → from: "literal_test_value"
+  * Page asks "what is 1+2+3+...+10?" → from: "55" (compute it yourself)
+  * Page says "enter any value" → from: "hello" (pick any reasonable value)
+
+WHEN TOOLS ARE NEEDED:
+- Create task objects that produce artifacts
+- Set final_answer_spec.from to reference an artifact key (e.g., "csv_data", "llm_result_1")
+
 
 AVAILABLE TOOLS:
 - render_js_page(url): Render page and get text/links/code
@@ -363,21 +377,38 @@ AVAILABLE TOOLS:
 - download_file(url): Download binary file
 - parse_csv(path OR url): Parse CSV from local path or URL → produces {"dataframe_key": "df_0", ...}
 - parse_excel/parse_json_file/parse_html_tables/parse_pdf_tables: Parse files
-- dataframe_ops(op, params): DataFrame operations
+- extract_patterns(text, pattern_type, custom_pattern): Extract patterns from text using regex
+  * pattern_type: "email", "url", "phone", "date", "number", "custom"
+  * Returns: {"matches": [list], "count": N, "pattern_type": type}
+- dataframe_ops(op, params): DataFrame operations (filter, sum, mean, count, etc.)
   * params MUST include "dataframe_key" (e.g., "df_0" from parse_csv)
-  * Example: {"op": "sum", "params": {"dataframe_key": "df_0", "column": "columnName"}}
-- make_plot(spec): Create chart
-- zip_base64(paths): Create zip archive
-- call_llm(prompt, system_prompt, max_tokens, temperature): Call LLM
+  * Filter operations create a NEW dataframe with a new key (e.g., "df_1")
+- train_linear_regression(dataframe_key, feature_columns, target_column, predict_x): Train sklearn linear regression model
+  * dataframe_key: "df_0" (from parse_csv)
+  * feature_columns: ["x"] (list of X column names)
+  * target_column: "y" (Y column name)
+  * predict_x: {"x": 50.0} (optional - values to predict for)
+  * Returns: {"coefficients": [...], "intercept": N, "r2_score": N, "prediction": N}
+- calculate_statistics(dataframe, stats, columns): Calculate statistical measures
+  * stats: ["sum", "mean", "median", "std", "min", "max", "count"]
+- make_plot(spec): Create charts/visualizations
+- zip_base64(paths): Create zip archive from file paths
+- call_llm(prompt, system_prompt, max_tokens, temperature): Call LLM for text analysis/extraction
+  * To reference artifacts in the prompt, use {{artifact_name}} or {artifact_name}
+  * Example: "Find max price in this data: {{json_data}}"
 
-CRITICAL TASK CHAINING RULES:
-- parse_csv creates a dataframe with key "df_0"
-- To use that dataframe, you MUST reference it: {"dataframe_key": "df_0"}
+CRITICAL ARTIFACT REFERENCE RULES:
+- parse_csv creates artifact containing {"dataframe_key": "df_0"}
+- To use that dataframe, reference the actual key: {"dataframe_key": "df_0"}
+- dataframe_ops filter creates NEW artifact containing {"dataframe_key": "df_1"} 
+- In subsequent tasks, use the ACTUAL dataframe key ("df_0", "df_1"), not the artifact name
+- **parse_csv REQUIRES URL OR FILE PATH**: NEVER use {{artifact}} syntax in parse_csv path!
+  * ✅ CORRECT: {"tool_name": "parse_csv", "inputs": {"url": "http://example.com/data.csv"}}
+  * ❌ WRONG: {"tool_name": "parse_csv", "inputs": {"path": "{{csv_data}}"}}
+- **call_llm ARTIFACT REFERENCES**: Use {{artifact_name}} in prompts ONLY
+  * ✅ CORRECT: {"tool_name": "call_llm", "inputs": {"prompt": "Analyze {{csv_data}}"}}
+  * This is for call_llm prompts only, not for parse_csv/parse_json/etc!
 - CSV files without headers have NUMERIC column names: "0", "1", "2", etc. (as strings!)
-- When summing/filtering CSV data, use column "0" for the first column
-- Example tasks for "sum numbers in CSV":
-  Task 1: {"id": "task_1", "tool_name": "parse_csv", "inputs": {"url": "data.csv"}, "produces": [{"key": "csv_data", "type": "json"}]}
-  Task 2: {"id": "task_2", "tool_name": "dataframe_ops", "inputs": {"op": "sum", "params": {"dataframe_key": "df_0", "column": "0"}}, "produces": [{"key": "sum_result", "type": "number"}]}
 """
     
     prompt = f"""
