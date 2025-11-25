@@ -8,7 +8,7 @@ import re
 import logging
 from typing import Any, Dict, List
 import httpx
-from tool_definitions import get_tool_definitions
+from tool_definitions import get_tool_definitions, get_tool_usage_examples
 
 logger = logging.getLogger(__name__)
 

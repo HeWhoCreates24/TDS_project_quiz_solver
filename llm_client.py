@@ -1,11 +1,15 @@
 """LLM client functions for making API calls to language models
 Handles plan generation, tool calling, and general LLM interactions
+
+CENTRAL LLM FUNCTION:
+All LLM calls go through call_llm() which handles both text and tool-based interactions.
+This ensures consistency and prevents tool schema drift.
 """
 import os
 import re
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import httpx
 from tool_definitions import get_tool_definitions, get_tool_usage_examples
 
@@ -16,8 +20,29 @@ logger = logging.getLogger(__name__)
 model = "openai/gpt-4o-mini"  # Fast, reliable, and cost-effective
 
 
-async def call_llm(prompt: str, system_prompt: str = None, max_tokens: int = 2000, temperature: float = 0) -> str:
-    """Call LLM with given prompt"""
+async def call_llm(
+    prompt: str, 
+    system_prompt: str = None, 
+    max_tokens: int = 2000, 
+    temperature: float = 0,
+    use_tools: bool = False,
+    tool_choice: str = "auto"
+) -> Any:
+    """
+    CENTRAL LLM FUNCTION - All LLM interactions go through here.
+    
+    Args:
+        prompt: User prompt
+        system_prompt: System prompt (defaults to generic assistant)
+        max_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+        use_tools: Whether to include tool definitions (function calling)
+        tool_choice: Tool choice mode ("auto", "required", "none")
+    
+    Returns:
+        - If use_tools=False: String response from LLM
+        - If use_tools=True: Full message object (may contain tool_calls)
+    """
     if system_prompt is None:
         system_prompt = "You are a helpful AI assistant."
     
@@ -27,6 +52,7 @@ async def call_llm(prompt: str, system_prompt: str = None, max_tokens: int = 200
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
     }
+    
     json_data = {
         "model": model,
         "messages": [
@@ -37,6 +63,14 @@ async def call_llm(prompt: str, system_prompt: str = None, max_tokens: int = 200
         "max_tokens": max_tokens,
     }
     
+    # Add tool definitions if requested
+    if use_tools:
+        tools = get_tool_definitions()
+        json_data["tools"] = tools
+        json_data["tool_choice"] = tool_choice
+        logger.info(f"[LLM_CALL] Using tools: {[t['function']['name'] for t in tools]}")
+        logger.info(f"[LLM_CALL] Tool choice mode: {tool_choice}")
+    
     logger.info(f"[LLM_CALL] System prompt: {system_prompt[:100]}...")
     logger.info(f"[LLM_CALL] User prompt: {prompt[:200]}...")
     
@@ -44,9 +78,20 @@ async def call_llm(prompt: str, system_prompt: str = None, max_tokens: int = 200
         response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
         response.raise_for_status()
         data = response.json()
-        answer_text = data["choices"][0]["message"]["content"]
-        logger.info(f"[LLM_RESPONSE] Content: {answer_text[:300]}...")
-        return answer_text.strip()
+        
+        if use_tools:
+            # Return full message object for tool calling
+            message = data["choices"][0]["message"]
+            if message.get("tool_calls"):
+                logger.info(f"[LLM_RESPONSE] Tool calls: {len(message['tool_calls'])}")
+            else:
+                logger.info(f"[LLM_RESPONSE] Text response: {message.get('content', '')[:300]}...")
+            return message
+        else:
+            # Return just the text content
+            answer_text = data["choices"][0]["message"]["content"]
+            logger.info(f"[LLM_RESPONSE] Content: {answer_text[:300]}...")
+            return answer_text.strip()
 
 
 async def call_llm_with_tools(page_data: Dict[str, Any], previous_attempts: List[Any] = None) -> Dict[str, Any]:
@@ -236,6 +281,12 @@ Remember: Call ALL tools needed in ONE response. We can execute multiple tools i
     # Get tool definitions
     tools = get_tool_definitions()
     
+    # Log the full prompt and tools being sent to LLM
+    logger.info(f"[LLM_PLAN_PROMPT] System: {system_prompt[:500]}...")
+    logger.info(f"[LLM_PLAN_PROMPT] User prompt: {prompt}")
+    logger.info(f"[LLM_PLAN_TOOLS] Available tools: {[t['function']['name'] for t in tools]}")
+    logger.info(f"[LLM_PLAN_TOOLS] Tool choice mode: {tool_choice_mode}")
+    
     json_data = {
         "model": model,
         "messages": [
@@ -336,7 +387,10 @@ Remember: Call ALL tools needed in ONE response. We can execute multiple tools i
 
 
 async def call_llm_for_plan(page_data: Dict[str, Any], previous_attempts: List[Any] = None) -> str:
-    """Generate execution plan using LLM with correct schema and previous attempt context"""
+    """
+    Generate execution plan using text-based JSON generation.
+    Uses centralized call_llm() with tool documentation in prompts.
+    """
     
     # Check for multimodal content
     page_text_lower = page_data.get('text', '').lower()
@@ -394,29 +448,121 @@ Use download_file + transcribe_audio to get instructions from the audio.
 You are an execution planner for an automated quiz-solving agent. Your job is to analyze a rendered quiz page and generate a machine-executable JSON plan.
 
 OUTPUT FORMAT - YOU MUST OUTPUT VALID JSON ONLY:
+
+=== EXAMPLE 1: VISUALIZATION QUIZ (chart + count categories) ===
+QUIZ TEXT: "Download CSV, create bar chart of 'category' vs 'total_sales', return number of categories"
+
 {
-  "submit_url": "string - the URL to POST the answer to",
-  "origin_url": "string - the original quiz page URL",
+  "submit_url": "http://example.com/submit",
+  "origin_url": "http://example.com/quiz",
   "tasks": [
     {
       "id": "task_1",
-      "tool_name": "tool_name_here",
-      "inputs": {},
-      "produces": [{"key": "output_key", "type": "string"}],
-      "notes": "description"
+      "tool_name": "parse_csv",
+      "inputs": {"url": "http://example.com/data.csv"},
+      "produces": [{"key": "csv_data"}],
+      "notes": "Parse CSV - produces artifact named 'csv_data'"
+    },
+    {
+      "id": "task_2",
+      "tool_name": "create_chart",
+      "inputs": {
+        "dataframe": "{{csv_data}}",
+        "chart_type": "bar",
+        "x_col": "category",
+        "y_col": "total_sales",
+        "title": "Sales by Category",
+        "output_path": "chart.png"
+      },
+      "produces": [{"key": "chart_result"}],
+      "notes": "Create chart - uses dataframe from csv_data artifact"
     }
   ],
   "final_answer_spec": {
-    "type": "boolean|number|string|json",
-    "from": "artifact_key or literal_value"
+    "type": "number",
+    "from": "chart_result.unique_categories"
   },
   "request_body": {
     "email_key": "email",
-    "secret_key": "secret", 
+    "secret_key": "secret",
     "url_value": "url",
     "answer_key": "answer"
   }
 }
+
+KEY POINTS FOR VISUALIZATION:
+- create_chart returns: {"chart_path": "...", "unique_categories": 5}
+- The unique_categories field contains the COUNT of unique values in x_col
+- For "how many categories" questions → use create_chart, reference .unique_categories
+- Do NOT use dataframe_ops count for category counting - use create_chart!
+- Reference artifacts using {{artifact_name}} syntax - system auto-extracts dataframe_key
+
+=== EXAMPLE 2: DATA TRANSFORMATION (pivot + sum) ===
+{
+  "submit_url": "http://example.com/submit",
+  "origin_url": "http://example.com/quiz",
+  "tasks": [
+    {
+      "id": "task_1",
+      "tool_name": "parse_csv",
+      "inputs": {"url": "http://example.com/data.csv"},
+      "produces": [{"key": "csv_data"}],
+      "notes": "Parse CSV"
+    },
+    {
+      "id": "task_2",
+      "tool_name": "dataframe_ops",
+      "inputs": {
+        "op": "pivot",
+        "params": {
+          "dataframe_key": "{{csv_data}}",
+          "index": "category",
+          "columns": "month",
+          "values": "sales"
+        }
+      },
+      "produces": [{"key": "pivoted_data"}],
+      "notes": "Pivot - uses {{csv_data}} reference"
+    },
+    {
+      "id": "task_3",
+      "tool_name": "dataframe_ops",
+      "inputs": {
+        "op": "sum",
+        "params": {
+          "dataframe_key": "{{pivoted_data}}",
+          "column": "January"
+        }
+      },
+      "produces": [{"key": "sum_result"}],
+      "notes": "Sum - uses {{pivoted_data}} reference"
+    }
+  ],
+  "final_answer_spec": {
+    "type": "number",
+    "from": "sum_result"
+  },
+  "request_body": {
+    "email_key": "email",
+    "secret_key": "secret",
+    "url_value": "url",
+    "answer_key": "answer"
+  }
+}
+
+CRITICAL task chaining rules:
+- parse_csv returns: {"dataframe_key": "df_X"} where X auto-increments
+- To reference that dataframe: use {{artifact_name}} syntax
+- Example: task_1 produces "csv_data" → task_2 uses "{{csv_data}}"
+- Example: task_2 produces "pivoted_data" → task_3 uses "{{pivoted_data}}"
+- The system will automatically extract the dataframe_key field
+- NEVER hardcode "df_0" - always use the {{artifact}} reference pattern
+
+CRITICAL dataframe_ops STRUCTURE:
+- MUST use "op" (NOT "operation")
+- MUST use "params" object with "dataframe_key" inside
+- WRONG: {"operation": "pivot", "dataframe": "df_0", "index": "...", ...}
+- RIGHT: {"op": "pivot", "params": {"dataframe_key": "df_0", "index": "...", ...}}
 
 CRITICAL: The request_body format above is FIXED - copy it EXACTLY as shown!
 - "email_key": "email" means the field name is "email" 
@@ -448,8 +594,13 @@ WHEN TOOLS ARE NEEDED:
 {get_tool_usage_examples()}
 
 CRITICAL ARTIFACT REFERENCE RULES:
-- parse_csv creates artifact containing {"dataframe_key": "df_0"}
-- To use that dataframe, reference the actual key: {"dataframe_key": "df_0"}
+- parse_csv produces: {"dataframe_key": "df_X"} where X is auto-incremented (df_0, df_1, df_2, etc.)
+- To reference the dataframe in next task: use the "produces" from previous task
+  * Task 1 produces: [{"key": "dataframe_key", "type": "df_0"}]
+  * Task 2 uses: {"params": {"dataframe_key": "df_0"}} - match the "type" value
+- DON'T hardcode df_0 everywhere - each parse_csv creates a NEW dataframe with unique key
+- Each dataframe operation (pivot, filter) creates a NEW dataframe: df_0 → filter → df_1
+- ALWAYS reference the actual dataframe key from the previous task's "produces"
 - dataframe_ops filter creates NEW artifact containing {"dataframe_key": "df_1"} 
 - In subsequent tasks, use the ACTUAL dataframe key ("df_0", "df_1"), not the artifact name
 - **parse_csv REQUIRES URL OR FILE PATH**: NEVER use {{artifact}} syntax in parse_csv path!
@@ -483,25 +634,14 @@ Requirements:
 OUTPUT ONLY THE JSON PLAN, NO OTHER TEXT.
 """
     
-    OPEN_AI_BASE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
-    API_KEY = os.getenv("API_KEY")
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    json_data = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
-        "max_tokens": 3000,
-    }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        plan_text = data["choices"][0]["message"]["content"]
-        logger.info(f"[LLM_PLAN] Raw plan response: {plan_text[:500]}")
-        return plan_text
+    # Use centralized call_llm
+    plan_text = await call_llm(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        max_tokens=3000,
+        temperature=0,
+        use_tools=False  # Text-based JSON generation
+    )
+    
+    logger.info(f"[LLM_PLAN] Raw plan response: {plan_text[:500]}")
+    return plan_text

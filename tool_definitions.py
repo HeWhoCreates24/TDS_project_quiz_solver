@@ -31,10 +31,19 @@ Text Processing:
 - extract_patterns(text, pattern_type, custom_pattern): Extract emails, URLs, numbers, etc.
 
 Data Transformation:
-- transform_data(dataframe, operation, params): Pivot, melt, transpose, reshape
-- dataframe_ops(op, params): Filter, sum, mean, count, select, groupby
+- dataframe_ops(op, params): All DataFrame operations including transformations
+  * CRITICAL STRUCTURE: {"op": "pivot", "params": {"dataframe_key": "df_0", "index": "...", "columns": "...", "values": "..."}}
+  * NOT this: {"operation": "pivot", "dataframe": "df_0", ...} ❌
+  * NOT this: {"op": "pivot", "dataframe_key": "df_0", ...} ❌
+  * Row operations: filter, sum, mean, count, select, groupby
+  * Shape operations: pivot, melt, transpose
+  * Pivot example: {"op": "pivot", "params": {"dataframe_key": "df_0", "index": "category", "columns": "month", "values": "sales"}}
+  * Sum example: {"op": "sum", "params": {"dataframe_key": "df_1", "column": "sales"}}
   * Filter creates NEW dataframe: df_0 → filter → df_1
 - calculate_statistics(dataframe, stats, columns): Calculate sum, mean, median, std, etc.
+  * IMPORTANT: Use 'dataframe' parameter to specify which dataframe key
+  * Example: {"dataframe": "df_0", "stats": ["sum"], "columns": ["sales"]}
+  * Use for STATISTICAL analysis on columns
 
 Machine Learning:
 - train_linear_regression(dataframe_key, feature_columns, target_column, predict_x): sklearn regression
@@ -48,8 +57,12 @@ Multimedia:
 - extract_audio_metadata(path): Get audio duration, sample rate, etc.
 
 Visualization:
-- create_chart(dataframe, chart_type, x_col, y_col, title, output_path): Static charts
-- create_interactive_chart(dataframe, chart_type, x_col, y_col, title): Plotly interactive
+- create_chart(dataframe, chart_type, x_col, y_col, title, output_path): Create static charts
+  * IMPORTANT: Use 'dataframe' parameter (the dataframe_key string, e.g., "df_0")
+  * Returns: {"chart_path": "path/to/chart.png", "unique_categories": N}
+  * The unique_categories field contains the COUNT of unique values in x_col
+  * Use this when quiz asks "how many categories in the chart"
+- create_interactive_chart(dataframe, chart_type, x_col, y_col, title): Plotly interactive charts
 - make_plot(spec): Custom plotting with detailed specs
 
 Utilities:
@@ -63,6 +76,20 @@ CRITICAL PATTERNS:
 - Audio → download_file + transcribe_audio
 - CSV analysis → parse_csv + dataframe_ops/calculate_statistics
 - Filtering → dataframe_ops creates NEW dataframe with new key
+- Pivoting/reshaping → parse_csv + dataframe_ops (op="pivot")
+  * Example: {"op": "pivot", "params": {"dataframe_key": "df_0", "index": "category", "columns": "month", "values": "sales"}}
+  * After pivot, columns become actual data values (e.g., "January", "February")
+- After pivot → use calculate_statistics or dataframe_ops on result
+
+PARAMETER NAMING CONVENTIONS:
+- dataframe_ops: Use {"op": "...", "params": {"dataframe_key": "df_X", ...}}
+  * CRITICAL: Parameter is "op" NOT "operation"
+  * CRITICAL: Dataframe identifier goes in params.dataframe_key NOT top-level "dataframe"
+  * Works for ALL operations: filter, sum, mean, count, select, groupby, pivot, melt, transpose
+  * Pivot example: {"op": "pivot", "params": {"dataframe_key": "df_0", "index": "category", "columns": "month", "values": "sales"}}
+  * Sum example: {"op": "sum", "params": {"dataframe_key": "df_1", "column": "January"}}
+- calculate_statistics: Use {"dataframe": "df_X", "stats": [...], "columns": [...]}
+  * The dataframe identifier is a top-level parameter called 'dataframe'
 """
 
 
@@ -281,47 +308,6 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                 }
             }
         },
-        # Data transformation
-        {
-            "type": "function",
-            "function": {
-                "name": "transform_data",
-                "description": "Transform data using various operations (reshape, pivot, melt, transpose)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "dataframe": {
-                            "type": "string",
-                            "description": "DataFrame key from registry (e.g., 'df_0')"
-                        },
-                        "operation": {
-                            "type": "string",
-                            "enum": ["pivot", "melt", "transpose", "reshape"],
-                            "description": "Transformation operation"
-                        },
-                        "params": {
-                            "type": "object",
-                            "description": "Operation-specific parameters",
-                            "properties": {
-                                "index": {
-                                    "type": "string",
-                                    "description": "For pivot: column to use as index"
-                                },
-                                "columns": {
-                                    "type": "string",
-                                    "description": "For pivot: column to use as columns"
-                                },
-                                "values": {
-                                    "type": "string",
-                                    "description": "For pivot: column to use as values"
-                                }
-                            }
-                        }
-                    },
-                    "required": ["dataframe", "operation"]
-                }
-            }
-        },
         # Multimedia processing
         {
             "type": "function",
@@ -367,14 +353,14 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "dataframe_ops",
-                "description": "Perform operations on DataFrames: filter rows, calculate sums/means, select columns, etc.",
+                "description": "Perform DataFrame operations: filter rows, calculate aggregations (sum/mean), select columns, group by categories, or reshape data (pivot/melt/transpose). Creates new DataFrames for operations that transform structure.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "op": {
                             "type": "string",
                             "description": "Operation type",
-                            "enum": ["filter", "sum", "mean", "count", "select", "groupby"]
+                            "enum": ["filter", "sum", "mean", "count", "select", "groupby", "pivot", "melt", "transpose"]
                         },
                         "params": {
                             "type": "object",
@@ -391,6 +377,28 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                                 "column": {
                                     "type": "string",
                                     "description": "For sum/mean: column name to aggregate"
+                                },
+                                "index": {
+                                    "type": "string",
+                                    "description": "For pivot: column name to use as row index"
+                                },
+                                "columns": {
+                                    "type": "string",
+                                    "description": "For pivot: column name whose values become new column headers"
+                                },
+                                "values": {
+                                    "type": "string",
+                                    "description": "For pivot: column name containing the data values"
+                                },
+                                "id_vars": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "For melt: columns to use as identifier variables"
+                                },
+                                "value_vars": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "For melt: columns to unpivot"
                                 }
                             },
                             "required": ["dataframe_key"]

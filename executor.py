@@ -18,7 +18,7 @@ from tool_executors import (
     parse_json_file, parse_html_tables, parse_pdf_tables,
     dataframe_ops, make_plot, zip_base64, answer_submit, extract_patterns
 )
-from llm_client import call_llm, call_llm_with_tools, call_llm_for_plan
+from llm_client import call_llm, call_llm_for_plan  # Centralized LLM calls
 from completion_checker import check_plan_completion, format_artifact, log_completion_stats
 from task_generator import generate_next_tasks
 from models import QuizAttempt, QuizRun
@@ -195,15 +195,14 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 logger.info(f"[TOOL_RESULT] {task_id}: download_file - File size: {result.get('size')} bytes")
                             elif tool_name == "analyze_image":
                                 from tool_executors import analyze_image
-                                # The LLM uses various parameter names: 'image_path', 'image', 'file', 'path'
-                                image_path = inputs.get("image_path") or inputs.get("image") or inputs.get("file") or inputs.get("path")
+                                image_path = inputs["image_path"]
                                 logger.info(f"[TOOL_EXEC] {task_id}: analyze_image - Task: {inputs['task']}, Image: {image_path}")
                                 result = await analyze_image(image_path, inputs["task"])
                                 logger.info(f"[TOOL_RESULT] {task_id}: analyze_image - Result: {result.get('result', '')[:200]}...")
                             elif tool_name == "extract_audio_metadata":
                                 from tools import MultimediaTools
-                                logger.info(f"[TOOL_EXEC] {task_id}: extract_audio_metadata - Path: {inputs.get('audio_path') or inputs.get('path')}")
-                                audio_path = inputs.get("audio_path") or inputs.get("path")
+                                audio_path = inputs["audio_path"]
+                                logger.info(f"[TOOL_EXEC] {task_id}: extract_audio_metadata - Path: {audio_path}")
                                 result = MultimediaTools.extract_audio_metadata(audio_path)
                                 logger.info(f"[TOOL_RESULT] {task_id}: extract_audio_metadata - {result}")
                             elif tool_name == "transcribe_audio":
@@ -240,17 +239,15 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 )
                                 logger.info(f"[TOOL_RESULT] {task_id}: extract_patterns - Found {result.get('count')} matches")
                             elif tool_name == "dataframe_ops":
-                                # Resolve dataframe_key if it's an artifact reference
                                 params = inputs.get("params", {})
-                                df_key = params.get("dataframe_key")
+                                op = inputs.get("op")
                                 
-                                # If df_key is an artifact name, resolve it to the actual dataframe_key
-                                if df_key and df_key in artifacts:
-                                    artifact = artifacts[df_key]
-                                    if isinstance(artifact, dict) and "dataframe_key" in artifact:
-                                        params["dataframe_key"] = artifact["dataframe_key"]
+                                if not op:
+                                    logger.error(f"[TOOL_EXEC] {task_id}: Missing 'op' parameter. Full inputs: {inputs}")
+                                    raise ValueError(f"dataframe_ops requires 'op' parameter. Got inputs: {list(inputs.keys())}")
                                 
-                                result = dataframe_ops(inputs["op"], params)
+                                logger.info(f"[TOOL_EXEC] {task_id}: dataframe_ops - op: {op}, params: {params}")
+                                result = dataframe_ops(op, params)
                             elif tool_name == "make_plot":
                                 result = make_plot(inputs["spec"])
                             elif tool_name == "zip_base64":
@@ -399,13 +396,47 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 result = AnalysisTools.geospatial_analysis(df, inputs["analysis_type"], **inputs.get("kwargs", {}))
                                 result = {"analysis_result": result}
                             elif tool_name == "create_chart":
-                                df = inputs["dataframe"]
-                                result = VisualizationTools.create_chart(df, inputs["chart_type"], inputs["x_col"], inputs["y_col"], inputs.get("title", ""), inputs.get("output_path"))
-                                result = {"chart_path": result}
+                                # Infrastructure: Resolve dataframe_key from registry
+                                from tool_executors import _dataframe_lock
+                                
+                                df_key = inputs["dataframe"]
+                                
+                                # Thread-safe registry read
+                                with _dataframe_lock:
+                                    if df_key not in dataframe_registry:
+                                        raise ValueError(f"DataFrame '{df_key}' not found in registry. Available: {list(dataframe_registry.keys())}")
+                                    df = dataframe_registry[df_key].copy()
+                                
+                                logger.info(f"[CREATE_CHART] DataFrame shape: {df.shape}, x_col: {inputs['x_col']}, y_col: {inputs['y_col']}")
+                                
+                                chart_path = VisualizationTools.create_chart(df, inputs["chart_type"], inputs["x_col"], inputs["y_col"], inputs.get("title", ""), inputs.get("output_path"))
+                                
+                                # Infrastructure: Count unique categories in x_col for quiz answers
+                                unique_categories = df[inputs["x_col"]].nunique()
+                                
+                                logger.info(f"[CREATE_CHART] Chart created at {chart_path}, unique categories in {inputs['x_col']}: {unique_categories}")
+                                result = {"chart_path": chart_path, "unique_categories": unique_categories}
                             elif tool_name == "create_interactive_chart":
-                                df = inputs["dataframe"]
-                                result = VisualizationTools.create_interactive_chart(df, inputs["chart_type"], inputs["x_col"], inputs["y_col"], inputs.get("title", ""), inputs.get("output_path"))
-                                result = {"chart_path": result}
+                                # Infrastructure: Resolve dataframe_key from registry
+                                from tool_executors import _dataframe_lock
+                                
+                                df_key = inputs["dataframe"]
+                                
+                                # Thread-safe registry read
+                                with _dataframe_lock:
+                                    if df_key not in dataframe_registry:
+                                        raise ValueError(f"DataFrame '{df_key}' not found in registry. Available: {list(dataframe_registry.keys())}")
+                                    df = dataframe_registry[df_key].copy()
+                                
+                                logger.info(f"[CREATE_INTERACTIVE_CHART] DataFrame shape: {df.shape}, x_col: {inputs['x_col']}, y_col: {inputs['y_col']}")
+                                
+                                chart_path = VisualizationTools.create_interactive_chart(df, inputs["chart_type"], inputs["x_col"], inputs["y_col"], inputs.get("title", ""), inputs.get("output_path"))
+                                
+                                # Infrastructure: Count unique categories in x_col for quiz answers
+                                unique_categories = df[inputs["x_col"]].nunique()
+                                
+                                logger.info(f"[CREATE_INTERACTIVE_CHART] Chart created at {chart_path}, unique categories in {inputs['x_col']}: {unique_categories}")
+                                result = {"chart_path": chart_path, "unique_categories": unique_categories}
                             elif tool_name == "generate_narrative":
                                 df = inputs["dataframe"]
                                 result = VisualizationTools.generate_narrative(df, inputs.get("summary_stats", {}))
@@ -668,7 +699,28 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
                 cleaned_key = re.sub(r"^static value\s*['\"]?|['\"]?$", "", cleaned_key)
                 cleaned_key = re.sub(r"^['\"]|['\"]$", "", cleaned_key).strip()
                 
-                if from_key in artifacts:
+                # Infrastructure: Handle nested field access with dot notation
+                # Example: "chart_result.unique_categories" → artifacts["chart_result"]["unique_categories"]
+                if '.' in cleaned_key:
+                    parts = cleaned_key.split('.')
+                    base_key = parts[0]
+                    if base_key in artifacts:
+                        final_answer = artifacts[base_key]
+                        # Navigate nested fields
+                        for field in parts[1:]:
+                            if isinstance(final_answer, dict) and field in final_answer:
+                                final_answer = final_answer[field]
+                                logger.info(f"[ARTIFACT_NESTED] Extracted field '{field}' from artifact '{base_key}'")
+                            else:
+                                logger.warning(f"[ARTIFACT_NESTED] Field '{field}' not found in artifact '{base_key}'")
+                                final_answer = None
+                                break
+                        selected_key = cleaned_key if final_answer is not None else "none"
+                    else:
+                        logger.warning(f"[ARTIFACT_NESTED] Base artifact '{base_key}' not found")
+                        final_answer = cleaned_key  # Use as literal
+                        selected_key = "literal"
+                elif from_key in artifacts:
                     final_answer = artifacts[from_key]
                     selected_key = from_key
                 elif cleaned_key in artifacts:
@@ -724,6 +776,15 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
                 # Extract just the count for "how many" questions
                 final_answer = final_answer['count']
                 logger.info(f"[ARTIFACT_EXTRACTION] Extracted count: {final_answer}")
+            
+            # Infrastructure: Handle chart result format: {'chart_path': 'path', 'unique_categories': N}
+            # For "how many categories" questions, extract the count
+            if isinstance(final_answer, dict) and 'chart_path' in final_answer and 'unique_categories' in final_answer:
+                logger.info(f"[ARTIFACT_EXTRACTION] Detected chart result: {final_answer}")
+                # Check if question asks for category count
+                if page_text and ('how many categor' in page_text.lower() or 'number of categor' in page_text.lower()):
+                    final_answer = final_answer['unique_categories']
+                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted unique_categories for count question: {final_answer}")
             
             # Handle train_linear_regression result format: {'prediction': value, 'coefficients': [...], ...}
             if isinstance(final_answer, dict) and 'prediction' in final_answer and 'model_type' in final_answer:
@@ -824,6 +885,10 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
         
         # Submit answer
         logger.info(f"Final answer ready for submission: {final_answer}")
+        
+        # Convert numpy types to native Python types for JSON serialization
+        if hasattr(final_answer, 'item'):
+            final_answer = final_answer.item()
         
         if quiz_attempt:
             quiz_attempt.answer = final_answer

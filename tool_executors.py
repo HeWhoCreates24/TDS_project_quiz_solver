@@ -532,6 +532,30 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         result = df.groupby(by).agg(agg)
     elif op == "count":
         result = len(df)
+    elif op == "pivot":
+        index = params.get("index")
+        columns = params.get("columns")
+        values = params.get("values")
+        
+        if not all([index, columns, values]):
+            raise ValueError("Pivot requires 'index', 'columns', and 'values' parameters")
+        
+        result = df.pivot(index=index, columns=columns, values=values)
+        result = result.reset_index()  # Reset index to make it a regular column
+    elif op == "melt":
+        id_vars = params.get("id_vars", [])
+        value_vars = params.get("value_vars")
+        var_name = params.get("var_name", "variable")
+        value_name = params.get("value_name", "value")
+        
+        result = df.melt(
+            id_vars=id_vars,
+            value_vars=value_vars,
+            var_name=var_name,
+            value_name=value_name
+        )
+    elif op == "transpose":
+        result = df.transpose()
     else:
         raise ValueError(f"Unknown operation: {op}")
     
@@ -547,6 +571,73 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         }
     else:
         return {"result": result, "type": type(result).__name__}
+
+
+def transform_data(dataframe: str, operation: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Transform DataFrame structure (pivot, melt, transpose, reshape)"""
+    if params is None:
+        params = {}
+    
+    # Thread-safe registry read
+    with _dataframe_lock:
+        if dataframe not in dataframe_registry:
+            raise ValueError(f"DataFrame {dataframe} not found in registry. Available: {list(dataframe_registry.keys())}")
+        df = dataframe_registry[dataframe].copy()
+    
+    result = None
+    
+    if operation == "pivot":
+        index = params.get("index")
+        columns = params.get("columns")
+        values = params.get("values")
+        
+        if not all([index, columns, values]):
+            raise ValueError("Pivot requires 'index', 'columns', and 'values' parameters")
+        
+        result = df.pivot(index=index, columns=columns, values=values)
+        result = result.reset_index()  # Reset index to make it a regular column
+        
+    elif operation == "melt":
+        id_vars = params.get("id_vars", [])
+        value_vars = params.get("value_vars")
+        var_name = params.get("var_name", "variable")
+        value_name = params.get("value_name", "value")
+        
+        result = df.melt(
+            id_vars=id_vars,
+            value_vars=value_vars,
+            var_name=var_name,
+            value_name=value_name
+        )
+        
+    elif operation == "transpose":
+        result = df.transpose()
+        
+    elif operation == "reshape":
+        # Generic reshape - let pandas handle the details
+        shape = params.get("shape")
+        if shape:
+            result = df.values.reshape(shape)
+            result = pd.DataFrame(result)
+        else:
+            raise ValueError("Reshape requires 'shape' parameter")
+    else:
+        raise ValueError(f"Unknown transform operation: {operation}")
+    
+    # Thread-safe registry write
+    with _dataframe_lock:
+        new_key = f"df_{len(dataframe_registry)}"
+        dataframe_registry[new_key] = result
+    
+    logger.info(f"[TRANSFORM] {operation} completed: {dataframe} → {new_key}, shape: {result.shape}")
+    
+    return {
+        "dataframe_key": new_key,
+        "operation": operation,
+        "shape": result.shape,
+        "columns": list(result.columns),
+        "sample": result.head(3).to_dict()
+    }
 
 
 async def analyze_image(image_path: str, task: str) -> Dict[str, Any]:
