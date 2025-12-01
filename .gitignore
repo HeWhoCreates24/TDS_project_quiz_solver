@@ -13,3 +13,11 @@ wheels/
 # test
 test.json
 test-data/
+test_advanced.json
+test_quizzes.py
+
+# old
+executor_old.py
+
+# docs
+docs/

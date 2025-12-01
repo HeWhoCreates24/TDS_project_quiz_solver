@@ -149,6 +149,45 @@ async def test_quiz(quiz_type: str):
             "code_blocks": [],
             "submit_url": "http://localhost:8080/test-quiz/visualize/submit",
             "origin_url": "http://localhost:8080/test-quiz/visualize"
+        },
+        
+        # ========== ADVANCED UNSEEN TEST CHAIN ==========
+        # These 3 quizzes test complex multi-tool workflows unseen in training
+        
+        "advanced_1": {
+            "text": "Download the JSON file containing product reviews. Extract all email addresses from the review text. Then fetch the API endpoint to get the blacklist. Return the count of emails that are NOT in the blacklist.",
+            "links": [
+                "http://localhost:8080/test-data/reviews.json",
+                "http://localhost:8080/test-api/email-blacklist"
+            ],
+            "audio_sources": [],
+            "video_sources": [],
+            "image_sources": [],
+            "code_blocks": [],
+            "submit_url": "http://localhost:8080/test-quiz/advanced_1/submit",
+            "origin_url": "http://localhost:8080/test-quiz/advanced_1"
+        },
+        
+        "advanced_2": {
+            "text": "Download the Excel file with sales data across multiple regions. Filter rows where revenue > 5000, then group by region and calculate the median revenue for each region. Return the region with the highest median revenue.",
+            "links": ["http://localhost:8080/test-data/regional_sales.xlsx"],
+            "audio_sources": [],
+            "video_sources": [],
+            "image_sources": [],
+            "code_blocks": [],
+            "submit_url": "http://localhost:8080/test-quiz/advanced_2/submit",
+            "origin_url": "http://localhost:8080/test-quiz/advanced_2"
+        },
+        
+        "advanced_3": {
+            "text": "Render the JavaScript page to extract the encoded message. The page contains a Base64 encoded text. Decode it to get a CSV data string. Parse the CSV data and build a linear regression model with 'hours_studied' as feature and 'exam_score' as target. Predict the exam score for a student who studied 8.5 hours.",
+            "links": ["http://localhost:8080/test-page/encoded-data"],
+            "audio_sources": [],
+            "video_sources": [],
+            "image_sources": [],
+            "code_blocks": [],
+            "submit_url": "http://localhost:8080/test-quiz/advanced_3/submit",
+            "origin_url": "http://localhost:8080/test-quiz/advanced_3"
         }
     }
     
@@ -290,6 +329,39 @@ Duplicate contact: support@example.com"""
             # Fallback to mock if file doesn't exist
             return Response(content=b"MOCK_IMAGE_WITH_TEXT_2048", media_type="image/png")
     
+    # Advanced test data files
+    elif filename == "reviews.json":
+        data = {
+            "reviews": [
+                {"id": 1, "text": "Great product! Contact me at alice@example.com for bulk orders."},
+                {"id": 2, "text": "Love it! Reach out to bob@company.org if you have questions."},
+                {"id": 3, "text": "Not bad. For support email charlie@test.com please."},
+                {"id": 4, "text": "Excellent service from support@spam.com team!"},
+                {"id": 5, "text": "Recommended! Email me at david@good.net for referrals."}
+            ]
+        }
+        return Response(content=json.dumps(data, indent=2), media_type="application/json")
+    
+    elif filename == "regional_sales.xlsx":
+        # Create Excel file with multi-region sales data
+        df = pd.DataFrame({
+            "region": ["North", "South", "East", "West", "North", "South", "East", "West",
+                      "North", "South", "East", "West", "North", "South", "East", "West"],
+            "product": ["A", "A", "A", "A", "B", "B", "B", "B",
+                       "C", "C", "C", "C", "D", "D", "D", "D"],
+            "revenue": [4500, 3200, 5500, 8900, 6200, 4100, 5800, 9200,
+                       3800, 5100, 4900, 8500, 5600, 3900, 6100, 9800]
+        })
+        # Return as CSV for simplicity (Excel parsing is complex in response)
+        import io
+        output = io.BytesIO()
+        df.to_excel(output, index=False)
+        output.seek(0)
+        return Response(
+            content=output.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    
     else:
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
 
@@ -359,7 +431,22 @@ async def submit_test_quiz(quiz_type: str, request: Request):
         },
         "visualize": {
             "expected": 5,  # Number of categories in chart
-            "next": None  # Last quiz in comprehensive chain
+            "next": None  # End of standard chain
+        },
+        
+        # Advanced unseen test chain
+        "advanced_1": {
+            "expected": 3,  # 3 emails not in blacklist (from 5 total emails)
+            "next": f"{base_url}/test-quiz/advanced_2"
+        },
+        "advanced_2": {
+            "expected": "West",  # Region with highest median revenue
+            "next": f"{base_url}/test-quiz/advanced_3"
+        },
+        "advanced_3": {
+            "expected": 77.0,  # Predicted exam score for 8.5 hours (y = 7*x + 17.5)
+            "tolerance": 3.0,  # Allow ±3 for ML prediction
+            "next": None  # End of advanced chain
         }
     }
     
@@ -412,6 +499,20 @@ async def test_api_config():
     }
 
 
+@router.get("/test-api/email-blacklist")
+async def test_api_email_blacklist():
+    """
+    Mock API endpoint for advanced_1 quiz
+    Returns list of blacklisted emails
+    """
+    return {
+        "blacklist": [
+            "support@spam.com",
+            "admin@blocked.net"
+        ]
+    }
+
+
 @router.get("/test-page/dynamic")
 async def test_dynamic_page():
     """
@@ -434,6 +535,53 @@ async def test_dynamic_page():
                 var container = document.getElementById('secret-container');
                 container.innerHTML = '<p>The secret code is: <strong>' + secretCode + '</strong></p>';
             });
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content)
+
+
+@router.get("/test-page/encoded-data")
+async def test_encoded_data_page():
+    """
+    Mock page with Base64 encoded CSV data for advanced_3 quiz
+    Returns HTML with JavaScript that shows encoded message
+    """
+    import base64
+    # Create CSV data: hours_studied,exam_score with linear relationship y = 7*x + 17.5
+    csv_data = """hours_studied,exam_score
+1,24
+2,32
+3,38
+4,45
+5,52
+6,60
+7,66
+8,74
+9,80
+10,87"""
+    
+    # Encode to base64
+    encoded = base64.b64encode(csv_data.encode()).decode()
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Encoded Data Page</title>
+    </head>
+    <body>
+        <h1>Encoded Message</h1>
+        <div id="message-container"></div>
+        <script>
+            // Display Base64 encoded data
+            document.addEventListener('DOMContentLoaded', function() {{
+                var encodedData = "{encoded}";
+                var container = document.getElementById('message-container');
+                container.innerHTML = '<p>Encoded message: <code>' + encodedData + '</code></p>';
+            }});
         </script>
     </body>
     </html>

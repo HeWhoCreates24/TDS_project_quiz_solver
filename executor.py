@@ -990,6 +990,66 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
             
             # Retry loop for incorrect answers
             while True:
+                # Check timeout BEFORE starting new attempt
+                if quiz_run.attempts:  # Skip check on first attempt
+                    elapsed_time = quiz_run.elapsed_time_since_first()
+                    max_retry_time = 180  # 3 minutes in seconds
+                    
+                    if elapsed_time >= max_retry_time:
+                        logger.warning(f"[QUIZ_TIMEOUT] Quiz exceeded {max_retry_time}s timeout before attempt. Elapsed: {elapsed_time:.1f}s")
+                        
+                        # Need to submit a dummy answer to get next URL
+                        logger.info(f"[QUIZ_TIMEOUT] Submitting timeout answer to get next URL")
+                        submit_url = page_data.get("submit_url", "") if 'page_data' in locals() else ""
+                        
+                        if submit_url:
+                            timeout_body = {
+                                "email": email,
+                                "secret": get_secret(),
+                                "url": current_url,
+                                "answer": "TIMEOUT_SKIP"
+                            }
+                            try:
+                                timeout_response = await answer_submit(submit_url, timeout_body)
+                                timeout_data = timeout_response.get("response", {})
+                                
+                                if "url" in timeout_data and timeout_data["url"]:
+                                    next_url = timeout_data["url"]
+                                    logger.info(f"[QUIZ_TIMEOUT_SKIP] Got next quiz URL: {next_url}")
+                                    
+                                    quiz_chain.append({
+                                        "quiz_url": current_url,
+                                        "quiz_run": quiz_run.to_dict(),
+                                        "timeout": True,
+                                        "reason": f"Exceeded {max_retry_time}s timeout before attempt"
+                                    })
+                                    
+                                    current_url = next_url
+                                    break  # Break to outer loop for next quiz
+                                else:
+                                    logger.error(f"[QUIZ_TIMEOUT_FAIL] No next URL in timeout response")
+                                    quiz_chain.append({
+                                        "quiz_url": current_url,
+                                        "quiz_run": quiz_run.to_dict(),
+                                        "timeout": True,
+                                        "failed": True,
+                                        "reason": f"Exceeded {max_retry_time}s timeout, no next quiz available"
+                                    })
+                                    break
+                            except Exception as e:
+                                logger.error(f"[QUIZ_TIMEOUT] Failed to submit timeout answer: {e}")
+                                quiz_chain.append({
+                                    "quiz_url": current_url,
+                                    "quiz_run": quiz_run.to_dict(),
+                                    "timeout": True,
+                                    "failed": True,
+                                    "reason": f"Timeout submission failed: {e}"
+                                })
+                                break
+                        else:
+                            logger.error(f"[QUIZ_TIMEOUT] No submit URL available")
+                            break
+                
                 # Create new attempt
                 quiz_attempt = quiz_run.start_attempt()
                 logger.info(f"[QUIZ_RUN] Starting attempt {quiz_attempt.attempt_number} for {current_url}")
@@ -1105,20 +1165,50 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
                     # Smart retry: check if average time per attempt < remaining time
                     if quiz_run.can_retry_smart(max_retry_time):
                         logger.info(f"[QUIZ_RETRY] Smart retry enabled - avg time ({avg_time:.1f}s) < remaining time ({remaining_time:.1f}s). Attempting again...")
-                        # Loop continues to next attempt
+                        # Loop continues to next attempt (timeout check at loop start will catch hard limit)
                         continue
                     else:
-                        logger.error(f"[QUIZ_FAILED] Not enough time for retry. Avg time: {avg_time:.1f}s >= Remaining: {remaining_time:.1f}s after {quiz_attempt.attempt_number} attempts.")
-                        quiz_chain.append({
-                            "quiz_url": current_url,
-                            "quiz_run": quiz_run.to_dict(),
-                            "failed": True,
-                            "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
-                        })
-                        break
+                        # Not enough time for retry - use response_data next URL if available
+                        logger.warning(f"[QUIZ_RETRY_SKIP] Not enough time for retry. Avg time: {avg_time:.1f}s >= Remaining: {remaining_time:.1f}s after {quiz_attempt.attempt_number} attempts.")
+                        
+                        # Check if there's a next quiz URL in the response
+                        if "url" in response_data and response_data["url"]:
+                            next_url = response_data["url"]
+                            logger.info(f"[QUIZ_RETRY_SKIP] Skipping to next quiz: {next_url}")
+                            
+                            quiz_chain.append({
+                                "quiz_url": current_url,
+                                "quiz_run": quiz_run.to_dict(),
+                                "skipped": True,
+                                "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
+                            })
+                            
+                            # Move to next quiz
+                            current_url = next_url
+                            break  # Break inner retry loop to start new quiz
+                        else:
+                            logger.error(f"[QUIZ_FAILED] No next quiz URL available. Stopping.")
+                            quiz_chain.append({
+                                "quiz_url": current_url,
+                                "quiz_run": quiz_run.to_dict(),
+                                "failed": True,
+                                "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
+                            })
+                            break  # Exit to outer loop which will stop
             
-            # Check if we should continue to next quiz (success case)
+            # Check if we should continue to next quiz
+            # Continue if: success with next URL, or timeout/skip with next URL
+            last_chain_entry = quiz_chain[-1] if quiz_chain else {}
+            has_next_url = False
+            
             if is_correct and "url" in response_data and response_data["url"]:
+                # Success case with next quiz
+                has_next_url = True
+            elif last_chain_entry.get("timeout") or last_chain_entry.get("skipped"):
+                # Timeout/skip case - check if we already set next URL
+                has_next_url = (current_url != url and current_url != last_chain_entry.get("quiz_url"))
+            
+            if has_next_url:
                 # Continue outer loop with new URL (already set above)
                 continue
             else:
@@ -1128,14 +1218,21 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
         logger.info(f"[PIPELINE_COMPLETE] Quiz chain complete. Solved {len(quiz_chain)} quizzes")
         
         # Calculate summary statistics
-        total_time = sum(qr.total_time for qr in quiz_runs.values())
-        successful_quizzes = [qc for qc in quiz_chain if qc.get("correct")]
+        total_time = sum(qr.elapsed_time_since_first() for qr in quiz_runs.values())
+        successful_quizzes = [qc for qc in quiz_chain if not qc.get("failed") and not qc.get("timeout") and not qc.get("skipped")]
+        timeout_quizzes = [qc for qc in quiz_chain if qc.get("timeout")]
+        skipped_quizzes = [qc for qc in quiz_chain if qc.get("skipped")]
+        failed_quizzes = [qc for qc in quiz_chain if qc.get("failed")]
         
         # Print clean summary
         print("\n" + "="*60)
         print("QUIZ SOLVER SUMMARY")
         print("="*60)
-        print(f"Total Quizzes Solved: {len(successful_quizzes)}/{len(quiz_chain)}")
+        print(f"Total Quizzes Attempted: {len(quiz_chain)}")
+        print(f"Successful: {len(successful_quizzes)}")
+        print(f"Timeout (skipped to next): {len(timeout_quizzes)}")
+        print(f"Skipped (insufficient time): {len(skipped_quizzes)}")
+        print(f"Failed: {len(failed_quizzes)}")
         print(f"Total Execution Time: {total_time:.2f}s")
         print(f"Average Time per Quiz: {total_time/len(quiz_chain):.2f}s")
         print("="*60 + "\n")
