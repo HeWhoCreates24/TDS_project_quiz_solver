@@ -230,6 +230,25 @@ class CleansingTools:
         except Exception as e:
             logger.error(f"[PATTERN_EXTRACT] Failed to extract with pattern: {e}")
             raise
+    
+    @staticmethod
+    def decode_base64(encoded_text: str) -> str:
+        """
+        Decode Base64 encoded text
+        
+        Args:
+            encoded_text: Base64 encoded string
+            
+        Returns:
+            Decoded text
+        """
+        try:
+            import base64
+            decoded_bytes = base64.b64decode(encoded_text)
+            return decoded_bytes.decode('utf-8')
+        except Exception as e:
+            logger.error(f"[BASE64_DECODE] Failed to decode Base64: {e}")
+            raise
 
 
 # ============================================================================

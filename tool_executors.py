@@ -216,15 +216,42 @@ def parse_csv(path: str = None, url: str = None) -> Dict[str, Any]:
     return asyncio.run(parse_csv_async(path, url))
 
 
-def parse_excel(path: str) -> Dict[str, Any]:
-    """Parse Excel file"""
+async def parse_excel_async(path: str) -> Dict[str, Any]:
+    """Parse Excel file (async version)"""
+    import asyncio
+    logger.info(f"[EXCEL_PARSE] Starting to parse {path}")
     try:
-        df = pd.read_excel(path)
+        # Handle URLs by downloading first
+        if path.startswith('http://') or path.startswith('https://'):
+            logger.info(f"[EXCEL_PARSE] Detected URL - downloading first")
+            import urllib.request
+            import tempfile
+            loop = asyncio.get_event_loop()
+            
+            def _download():
+                response = urllib.request.urlopen(path)
+                content = response.read()
+                # Create temp file with proper extension
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
+                temp_file.write(content)
+                temp_file.close()
+                return temp_file.name
+            
+            local_path = await loop.run_in_executor(None, _download)
+            logger.info(f"[EXCEL_PARSE] Downloaded to {local_path}")
+        else:
+            local_path = path
+        
+        # Run blocking I/O in thread pool
+        loop = asyncio.get_event_loop()
+        df = await loop.run_in_executor(None, pd.read_excel, local_path)
+        logger.info(f"[EXCEL_PARSE] File loaded, shape: {df.shape}")
         
         # Thread-safe registry write
         with _dataframe_lock:
             df_key = f"df_{len(dataframe_registry)}"
             dataframe_registry[df_key] = df
+        logger.info(f"[EXCEL_PARSE] Registered as {df_key}")
         
         return {
             "dataframe_key": df_key,
@@ -237,21 +264,45 @@ def parse_excel(path: str) -> Dict[str, Any]:
         raise
 
 
-def parse_json_file(path: str) -> Dict[str, Any]:
-    """Parse JSON file"""
+def parse_excel(path: str) -> Dict[str, Any]:
+    """Parse Excel file (sync wrapper)"""
+    import asyncio
+    return asyncio.run(parse_excel_async(path))
+
+
+async def parse_json_file_async(path: str) -> Dict[str, Any]:
+    """Parse JSON file (async version)"""
+    import asyncio
+    logger.info(f"[JSON_PARSE] Starting to parse {path}")
     try:
-        with open(path, 'r') as f:
-            data = json.load(f)
+        loop = asyncio.get_event_loop()
+        
+        def _read_json():
+            with open(path, 'r') as f:
+                return json.load(f)
+        
+        data = await loop.run_in_executor(None, _read_json)
+        logger.info(f"[JSON_PARSE] Loaded {type(data).__name__} with {len(data) if isinstance(data, (list, dict)) else 'N/A'} items")
         return {"data": data, "type": type(data).__name__}
     except Exception as e:
         logger.error(f"Error parsing JSON {path}: {e}")
         raise
 
 
-def parse_html_tables(html_content: str) -> Dict[str, Any]:
-    """Parse HTML tables"""
+def parse_json_file(path: str) -> Dict[str, Any]:
+    """Parse JSON file (sync wrapper)"""
+    import asyncio
+    return asyncio.run(parse_json_file_async(path))
+
+
+async def parse_html_tables_async(html_content: str) -> Dict[str, Any]:
+    """Parse HTML tables (async version)"""
+    import asyncio
+    logger.info(f"[HTML_PARSE] Starting to parse HTML (length: {len(html_content)})")
     try:
-        tables = pd.read_html(html_content)
+        loop = asyncio.get_event_loop()
+        tables = await loop.run_in_executor(None, pd.read_html, html_content)
+        logger.info(f"[HTML_PARSE] Found {len(tables)} table(s)")
         result = {}
         
         # Thread-safe registry writes
@@ -263,14 +314,23 @@ def parse_html_tables(html_content: str) -> Dict[str, Any]:
                     "dataframe_key": df_key,
                     "shape": table.shape
                 }
+        logger.info(f"[HTML_PARSE] Registered {len(tables)} dataframes")
         return {"tables": result}
     except Exception as e:
         logger.error(f"Error parsing HTML tables: {e}")
         raise
 
 
-def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
-    """Parse PDF tables and store in dataframe registry"""
+def parse_html_tables(html_content: str) -> Dict[str, Any]:
+    """Parse HTML tables (sync wrapper)"""
+    import asyncio
+    return asyncio.run(parse_html_tables_async(html_content))
+
+
+async def parse_pdf_tables_async(path: str, pages: str = "all") -> Dict[str, Any]:
+    """Parse PDF tables and store in dataframe registry (async version)"""
+    import asyncio
+    logger.info(f"[PDF_PARSE] Starting to parse {path}, pages: {pages}")
     try:
         import pdfplumber
         
@@ -278,15 +338,23 @@ def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
         if isinstance(path, dict):
             path = path.get('path', path)
         
-        all_tables = []
-        with pdfplumber.open(path) as pdf:
-            page_list = range(len(pdf.pages)) if pages == "all" else [int(p) - 1 for p in pages.split(",")]
-            
-            for page_num in page_list:
-                if page_num < len(pdf.pages):
-                    page = pdf.pages[page_num]
-                    tables = page.extract_tables()
-                    all_tables.extend(tables)
+        # Run blocking I/O in thread pool
+        loop = asyncio.get_event_loop()
+        
+        def _extract_pdf_tables():
+            all_tables = []
+            with pdfplumber.open(path) as pdf:
+                page_list = range(len(pdf.pages)) if pages == "all" else [int(p) - 1 for p in pages.split(",")]
+                
+                for page_num in page_list:
+                    if page_num < len(pdf.pages):
+                        page = pdf.pages[page_num]
+                        tables = page.extract_tables()
+                        all_tables.extend(tables)
+            return all_tables
+        
+        all_tables = await loop.run_in_executor(None, _extract_pdf_tables)
+        logger.info(f"[PDF_PARSE] Extracted {len(all_tables)} table(s)")
         
         if not all_tables:
             logger.warning(f"No tables found in PDF {path}")
@@ -305,6 +373,7 @@ def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
         
         df_key = f"df_{len(dataframe_registry)}"
         dataframe_registry[df_key] = df
+        logger.info(f"[PDF_PARSE] Registered as {df_key}, shape: {df.shape}")
         
         logger.info(f"[PDF_PARSE] Extracted {len(all_tables)} table(s), registered as {df_key}")
         
@@ -319,8 +388,14 @@ def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
         logger.error("pdfplumber not installed - cannot parse PDF tables")
         raise ImportError("Please install pdfplumber: pip install pdfplumber")
     except Exception as e:
-        logger.error(f"Error parsing PDF {path}: {e}")
+        logger.error(f"Error parsing PDF tables from {path}: {e}")
         raise
+
+
+def parse_pdf_tables(path: str, pages: str = "all") -> Dict[str, Any]:
+    """Parse PDF tables (sync wrapper)"""
+    import asyncio
+    return asyncio.run(parse_pdf_tables_async(path, pages))
 
 
 def extract_patterns(text: str, pattern_type: str, custom_pattern: str = None) -> Dict[str, Any]:
@@ -527,9 +602,16 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             result = df.mean()
     elif op == "groupby":
+        # Use canonical parameter names only
         by = params.get("by")
         agg = params.get("aggregation", "count")
+        
+        if not by:
+            raise ValueError("groupby requires 'by' parameter (array of column names to group by)")
+        
         result = df.groupby(by).agg(agg)
+        # Reset index to make grouped columns accessible as regular columns
+        result = result.reset_index()
     elif op == "count":
         result = len(df)
     elif op == "pivot":
@@ -556,6 +638,25 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         )
     elif op == "transpose":
         result = df.transpose()
+    elif op == "idxmax" or op == "idxmin":
+        value_column = params.get("value_column")
+        label_column = params.get("label_column")
+        
+        if not value_column:
+            raise ValueError(f"{op} requires 'value_column' parameter")
+        
+        # Find index of max/min value
+        if op == "idxmax":
+            idx = df[value_column].idxmax()
+        else:
+            idx = df[value_column].idxmin()
+        
+        # If label_column specified, return that value from the row
+        if label_column:
+            result = df.loc[idx, label_column]
+        else:
+            # Return the entire row as dict
+            result = df.loc[idx].to_dict()
     else:
         raise ValueError(f"Unknown operation: {op}")
     

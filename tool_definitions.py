@@ -22,7 +22,10 @@ Web & Data Fetching:
 - download_file(url): Download binary files (images, audio, PDFs, etc.)
 
 File Parsing:
-- parse_csv(path OR url): Parse CSV → produces {"dataframe_key": "df_0"}
+- parse_csv(path OR url): Parse CSV file → produces {"dataframe_key": "df_0"}
+- parse_csv_data(csv_content, delimiter): Parse CSV string content → produces {"dataframe_key": "df_X"}
+  * Use after decode_base64 or when you have CSV as a string
+  * Example: decode_base64 → parse_csv_data(decoded_text)
 - parse_excel(path): Parse Excel files → produces dataframe
 - parse_json_file(path): Parse JSON to dataframe → produces {"dataframe_key": "df_X"}
   * Use this to convert JSON to dataframe for dataframe_ops
@@ -32,36 +35,53 @@ File Parsing:
 
 Text Processing:
 - clean_text(text, remove_special_chars, normalize_whitespace): Clean/normalize text
+- extract_html_text(html, selector): Extract text content from HTML
+  * Use to extract Base64 strings, codes, or other text from HTML pages
+  * selector: Optional CSS selector to target specific elements
+  * Returns: {"text": "extracted content"}
+- decode_base64(encoded_text): Decode Base64 encoded text/data
+  * Input should be the Base64 string itself (extract from HTML first if needed using extract_html_text)
+  * Returns: {"decoded_text": "..."}
+  * Example workflow: render_js_page → extract_html_text(html, "code") → decode_base64 → parse_csv_data
 - extract_patterns(text, pattern_type, custom_pattern): Extract patterns from text
   * pattern_type: "email", "url", "phone", "date", "number" (SINGULAR, not "emails")
   * Returns: {"matches": [...], "count": N}
   * Example: {"text": "Contact support@example.com", "pattern_type": "email"}
+  * Use to extract specific values from natural language text (e.g., numbers from "The answer is 42")
 
 Data Transformation:
 - dataframe_ops(op, params): All DataFrame operations including transformations
-  * ONLY works on DATAFRAMES (from parse_csv, parse_excel, parse_json_file)
-  * Does NOT work on JSON from fetch_from_api - that's just a dict
+  * Works on dataframes (from parse_csv, parse_excel, parse_json_file)
+  * JSON from fetch_from_api is a dict, not a dataframe - use call_llm for dict queries
   * Dataframe reference: Use params.dataframe_key = "{{artifact_name}}" with template markers
-  * CRITICAL STRUCTURE: {"op": "pivot", "params": {"dataframe_key": "{{df_0}}", "index": "...", "columns": "...", "values": "..."}}
-  * NOT this: {"operation": "pivot", "dataframe": "df_0", ...} ❌
-  * NOT this: {"op": "pivot", "dataframe_key": "df_0", ...} ❌ (missing template markers)
-  * Row operations: filter, sum, mean, count, select, groupby
+  * Structure: {"op": "pivot", "params": {"dataframe_key": "{{df_0}}", "index": "...", "columns": "...", "values": "..."}}
+  * Row operations: filter, sum, mean, count, select
+  * Aggregation: groupby (with 'by' and 'aggregation' parameters)
   * Shape operations: pivot, melt, transpose
+  * Row extraction: idxmax, idxmin (find row with max/min value and extract label)
+  * Groupby example: {"op": "groupby", "params": {"dataframe_key": "{{df_0}}", "by": ["region"], "aggregation": {"revenue": "median"}}}
+    - Parameter 'by': Array of column names to group by
+    - Parameter 'aggregation': String like "count" OR dict like {"revenue": "median"}. Default: "count"
+    - Result has grouped columns as regular columns (index reset automatically)
+  * Idxmax example: {"op": "idxmax", "params": {"dataframe_key": "{{df_2}}", "value_column": "revenue", "label_column": "region"}}
+    - Finds the row with max value in 'value_column'
+    - Returns the value from 'label_column' in that row (e.g., region name)
+    - Use when you need the LABEL (e.g., "West") not the VALUE (e.g., 9050)
   * Pivot example: {"op": "pivot", "params": {"dataframe_key": "{{df_0}}", "index": "category", "columns": "month", "values": "sales"}}
   * Sum example: {"op": "sum", "params": {"dataframe_key": "{{df_1}}", "column": "sales"}}
   * Filter creates NEW dataframe: df_0 → filter → df_1
 
 - calculate_statistics(dataframe, stats, columns): Calculate sum, mean, median, std, etc.
-  * ONLY works on DATAFRAMES (dataframe_key like "df_0")
+  * Works on dataframes (dataframe_key like "df_0")
   * Dataframe reference: Use dataframe = "{{artifact_name}}" with template markers
-  * IMPORTANT: Use top-level 'dataframe' parameter to specify which dataframe
+  * Parameter name: 'dataframe' (top-level parameter specifying which dataframe)
   * Example: {"dataframe": "{{df_0}}", "stats": ["sum"], "columns": ["sales"]}
-  * Use for STATISTICAL analysis on columns
+  * Use for statistical analysis on columns
 
 Machine Learning:
 - train_linear_regression(dataframe_key, feature_columns, target_column, predict_x): sklearn regression
   * Dataframe reference: Use dataframe_key = "{{artifact_name}}" with template markers
-  * IMPORTANT: Use top-level 'dataframe_key' parameter to specify which dataframe
+  * Parameter name: 'dataframe_key' (top-level parameter specifying which dataframe)
   * Example: {"dataframe_key": "{{df_0}}", "feature_columns": ["x"], "target_column": "y", "predict_x": {"x": 50}}
   * Returns model coefficients and optional prediction
 
@@ -69,6 +89,9 @@ Machine Learning:
 
 Multimedia:
 - transcribe_audio(audio_path): Speech-to-text transcription
+  * Returns: {"text": "transcribed content"}
+  * Transcription output may contain natural language - use extract_patterns or call_llm to parse specific values
+  * Example: transcription returns "The answer is 42" → use extract_patterns(text, "number") to get "42"
 - analyze_image(image_path, task): Vision AI for OCR, description, object detection, classification
   * task="ocr" extracts text/numbers from images
   * Use for ANY image analysis, NOT call_llm (call_llm cannot process images)
@@ -77,10 +100,10 @@ Multimedia:
 Visualization:
 - create_chart(dataframe, chart_type, x_col, y_col, title, output_path): Create static charts
   * Dataframe reference: Use dataframe = "{{artifact_name}}" with template markers
-  * IMPORTANT: Use 'dataframe' parameter (the dataframe_key string, e.g., "df_0")
-  * output_path is OPTIONAL - omit this parameter when chart saving is not needed
+  * Parameter name: 'dataframe' (the dataframe_key string, e.g., "df_0")
+  * output_path is optional - omit this parameter when chart saving is not needed
   * Returns: {"chart_path": "path/to/chart.png", "unique_categories": N}
-  * The unique_categories field contains the COUNT of unique values in x_col
+  * The unique_categories field contains the count of unique values in x_col
   * Use this when quiz asks "how many categories in the chart"
   * Example (no saving): {"dataframe": "{{df_0}}", "chart_type": "bar", "x_col": "category", "y_col": "sales"}
   * Example (with saving): {"dataframe": "{{df_0}}", "chart_type": "bar", "x_col": "category", "y_col": "sales", "output_path": "/absolute/path/to/chart.png"}
@@ -88,10 +111,10 @@ Visualization:
 - make_plot(spec): Custom plotting with detailed specs
 
 Utilities:
-- call_llm(prompt, system_prompt, max_tokens, temperature): Text analysis only (NOT for images)
-  * Use for simple JSON queries (find max, filter, etc.) when data is NOT a dataframe
+- call_llm(prompt, system_prompt, max_tokens, temperature): Send text to LLM for analysis
+  * Use for simple JSON queries (find max, filter, extract values) when working with text/JSON data
   * Example: Find product with highest price from JSON → use call_llm
-  * For dataframes, use dataframe_ops or calculate_statistics instead
+  * For structured dataframes, dataframe_ops or calculate_statistics provide specialized operations
   
   **HOW TO WRITE EFFECTIVE call_llm PROMPTS:**
   * Be SPECIFIC about output format: "Return only the product ID as a plain string"
@@ -110,6 +133,11 @@ CRITICAL PATTERNS:
 - Images → download_file + analyze_image (task="ocr")
 - Audio → download_file + transcribe_audio
 - CSV/Excel analysis → parse_csv/parse_excel + dataframe_ops/calculate_statistics
+- Base64 in HTML → render_js_page + extract_html_text(html, selector) + decode_base64 + parse_csv_data
+  * Extract the Base64 string from HTML using a CSS selector to target the encoded text element
+  * Common selectors for encoded data: "code", "pre", "#message-container code", ".encoded"
+  * Example: extract_html_text(html="{{html_content}}", selector="code")
+  * Using a selector extracts only the target element; omitting it extracts all text from the page
 - JSON queries → fetch_from_api + call_llm (for simple queries)
 - JSON to dataframe → download_file + parse_json_file + dataframe_ops
 - Filtering → dataframe_ops creates NEW dataframe with new key
@@ -212,9 +240,9 @@ ARTIFACT REFERENCE RULES:
 - Executor resolves {{artifact_name}} → extracts dataframe_key → passes to tool
 - Example: parse_csv creates "df_0" artifact → use {"dataframe_key": "{{df_0}}"} in next tool
 - dataframe_ops filter creates NEW artifact: df_0 → filter → df_1 (new artifact with new registry key)
-- parse_csv REQUIRES URL OR FILE PATH - NEVER use {{artifact}} syntax in parse_csv!
-  * ✅ CORRECT: {"tool_name": "parse_csv", "inputs": {"url": "http://example.com/data.csv"}}
-  * ❌ WRONG: {"tool_name": "parse_csv", "inputs": {"path": "{{csv_data}}"}}
+- parse_csv expects a direct URL or file path to fetch data from:
+  * Example: {"tool_name": "parse_csv", "inputs": {"url": "http://example.com/data.csv"}}
+  * For CSV content already in memory, use parse_csv_data instead: {"csv_content": "{{decoded_text}}"}
 - CSV files without headers have NUMERIC column names: "0", "1", "2", etc. (as strings!)
 
 WORKFLOW PATTERNS:
@@ -338,6 +366,27 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "parse_csv_data",
+                "description": "Parse CSV content from a string (e.g., decoded Base64, API response) into a pandas DataFrame",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "csv_content": {
+                            "type": "string",
+                            "description": "CSV content as a string"
+                        },
+                        "delimiter": {
+                            "type": "string",
+                            "description": "CSV delimiter character (default: comma)"
+                        }
+                    },
+                    "required": ["csv_content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "parse_excel",
                 "description": "Parse Excel file (.xlsx, .xls) into a DataFrame",
                 "parameters": {
@@ -436,6 +485,44 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "extract_html_text",
+                "description": "Extract text content from HTML. Provide a CSS selector to target specific elements (e.g., 'code', 'pre' for Base64 strings). Without a selector, extracts all visible text from the page.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "html": {
+                            "type": "string",
+                            "description": "HTML content to extract text from"
+                        },
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector to target specific elements. For Base64/encoded data, use 'code' or 'pre'. Examples: 'code', '#message-container code', 'pre', '.encoded-text'"
+                        }
+                    },
+                    "required": ["html"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "decode_base64",
+                "description": "Decode Base64 encoded text. Use this for encoded messages, data, or content that needs to be decoded.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "encoded_text": {
+                            "type": "string",
+                            "description": "Base64 encoded string to decode"
+                        }
+                    },
+                    "required": ["encoded_text"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "extract_patterns",
                 "description": "Extract patterns from text using regex (emails, URLs, phone numbers, etc.)",
                 "parameters": {
@@ -511,7 +598,7 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                         "op": {
                             "type": "string",
                             "description": "Operation type",
-                            "enum": ["filter", "sum", "mean", "count", "select", "groupby", "pivot", "melt", "transpose"]
+                            "enum": ["filter", "sum", "mean", "count", "select", "groupby", "pivot", "melt", "transpose", "idxmax", "idxmin"]
                         },
                         "params": {
                             "type": "object",
@@ -523,11 +610,16 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                                 },
                                 "condition": {
                                     "type": "string",
-                                    "description": "For filter: COMPLETE condition string with column name, operator, and value (e.g., '96903 >= 1371' or 'temperature > 25'). MUST include the full comparison value."
+                                    "description": "For filter: Complete condition string with column name, operator, and value (e.g., '96903 >= 1371' or 'temperature > 25'). Include the full comparison value."
                                 },
                                 "column": {
                                     "type": "string",
                                     "description": "For sum/mean: column name to aggregate"
+                                },
+                                "columns": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "For select: list of column names to select/keep"
                                 },
                                 "index": {
                                     "type": "string",
@@ -550,6 +642,30 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                                     "type": "array",
                                     "items": {"type": "string"},
                                     "description": "For melt: columns to unpivot"
+                                },
+                                "var_name": {
+                                    "type": "string",
+                                    "description": "For melt: name for the 'variable' column (default: 'variable')"
+                                },
+                                "value_name": {
+                                    "type": "string",
+                                    "description": "For melt: name for the 'value' column (default: 'value')"
+                                },
+                                "by": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "For groupby: column names to group by (e.g., ['region'])"
+                                },
+                                "aggregation": {
+                                    "description": "For groupby: aggregation specification. Can be a string (e.g., 'count') or dict mapping columns to functions (e.g., {'revenue': 'median'}). Default: 'count'"
+                                },
+                                "value_column": {
+                                    "type": "string",
+                                    "description": "For idxmax/idxmin: column to find max/min value in"
+                                },
+                                "label_column": {
+                                    "type": "string",
+                                    "description": "For idxmax/idxmin: column to extract value from the row with max/min (e.g., region name)"
                                 }
                             },
                             "required": ["dataframe_key"]

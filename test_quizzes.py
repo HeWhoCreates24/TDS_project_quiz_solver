@@ -436,7 +436,7 @@ async def submit_test_quiz(quiz_type: str, request: Request):
         
         # Advanced unseen test chain
         "advanced_1": {
-            "expected": 3,  # 3 emails not in blacklist (from 5 total emails)
+            "expected": 4,  # 4 emails not in blacklist: alice, bob, charlie, david (support@spam.com is blacklisted)
             "next": f"{base_url}/test-quiz/advanced_2"
         },
         "advanced_2": {

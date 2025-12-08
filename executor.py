@@ -14,8 +14,8 @@ from dotenv import load_dotenv
 # Import from refactored modules
 from tool_executors import (
     dataframe_registry, get_secret, extract_json_from_markdown,
-    render_page, fetch_text, download_file, parse_csv_async, parse_excel,
-    parse_json_file, parse_html_tables, parse_pdf_tables,
+    render_page, fetch_text, download_file, parse_csv_async, parse_excel_async,
+    parse_json_file_async, parse_html_tables_async, parse_pdf_tables_async,
     dataframe_ops, make_plot, zip_base64, answer_submit, extract_patterns
 )
 from llm_client import call_llm, call_llm_for_plan  # Centralized LLM calls
@@ -160,8 +160,12 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                                 return artifact_data['path']
                                             elif 'content' in artifact_data:
                                                 return artifact_data['content']
+                                            elif 'html' in artifact_data:
+                                                return artifact_data['html']
                                             elif 'text' in artifact_data:
                                                 return artifact_data['text']
+                                            elif 'decoded_text' in artifact_data:
+                                                return artifact_data['decoded_text']
                                             elif 'dataframe_key' in artifact_data:
                                                 resolved = artifact_data['dataframe_key']
                                                 logger.info(f"[ARTIFACT_RESOLVE] Resolved {{{{{artifact_ref}}}}} in {tool_name}.{path} → {resolved}")
@@ -223,13 +227,21 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 )
                                 logger.info(f"[TOOL_RESULT] {task_id}: parse_csv - DataFrame: {result.get('dataframe_key')}, Shape: {result.get('shape')}")
                             elif tool_name == "parse_excel":
-                                result = parse_excel(inputs["path"])
+                                logger.info(f"[TOOL_EXEC] {task_id}: parse_excel - Path: {inputs.get('path')}")
+                                result = await parse_excel_async(inputs["path"])
+                                logger.info(f"[TOOL_RESULT] {task_id}: parse_excel - DataFrame: {result.get('dataframe_key')}, Shape: {result.get('shape')}")
                             elif tool_name == "parse_json_file":
-                                result = parse_json_file(inputs["path"])
+                                logger.info(f"[TOOL_EXEC] {task_id}: parse_json_file - Path: {inputs.get('path')}")
+                                result = await parse_json_file_async(inputs["path"])
+                                logger.info(f"[TOOL_RESULT] {task_id}: parse_json_file - Loaded {len(result.get('data', []))} items")
                             elif tool_name == "parse_html_tables":
-                                result = parse_html_tables(inputs["path_or_html"])
+                                logger.info(f"[TOOL_EXEC] {task_id}: parse_html_tables - Path: {inputs.get('path_or_html', '')[:100]}")
+                                result = await parse_html_tables_async(inputs["path_or_html"])
+                                logger.info(f"[TOOL_RESULT] {task_id}: parse_html_tables - DataFrame: {result.get('dataframe_key')}, Tables: {result.get('tables_found')}")
                             elif tool_name == "parse_pdf_tables":
-                                result = parse_pdf_tables(inputs["path"], inputs.get("pages") or "all")
+                                logger.info(f"[TOOL_EXEC] {task_id}: parse_pdf_tables - Path: {inputs.get('path')}, Pages: {inputs.get('pages', 'all')}")
+                                result = await parse_pdf_tables_async(inputs["path"], inputs.get("pages") or "all")
+                                logger.info(f"[TOOL_RESULT] {task_id}: parse_pdf_tables - DataFrame: {result.get('dataframe_key')}, Tables: {result.get('tables_found')}")
                             elif tool_name == "extract_patterns":
                                 logger.info(f"[TOOL_EXEC] {task_id}: extract_patterns - Pattern: {inputs.get('pattern_type')}")
                                 text = inputs["text"]
@@ -317,17 +329,29 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             elif tool_name == "fetch_from_api":
                                 result = await ScrapingTools.fetch_from_api(inputs["url"], inputs.get("method", "GET"), inputs.get("headers"), inputs.get("body"), inputs.get("timeout", 30))
                             elif tool_name == "extract_html_text":
+                                logger.info(f"[TOOL_EXEC] {task_id}: extract_html_text - HTML length: {len(inputs['html'])}, selector: {inputs.get('selector', 'auto-detect')}")
                                 result = await ScrapingTools.extract_html_text(inputs["html"], inputs.get("selector"))
+                                logger.info(f"[TOOL_RESULT] {task_id}: extract_html_text - Extracted text length: {len(result)}")
                                 result = {"text": result}
                             elif tool_name == "clean_text":
                                 result = CleansingTools.clean_text(inputs["text"], inputs.get("lowercase", False), inputs.get("remove_special", True), inputs.get("remove_whitespace", True))
                                 result = {"cleaned_text": result}
+                            elif tool_name == "decode_base64":
+                                logger.info(f"[TOOL_EXEC] {task_id}: decode_base64 - Encoded text length: {len(inputs['encoded_text'])}")
+                                result = CleansingTools.decode_base64(inputs["encoded_text"])
+                                logger.info(f"[TOOL_RESULT] {task_id}: decode_base64 - Decoded text length: {len(result)}")
+                                result = {"decoded_text": result}
                             elif tool_name == "extract_from_pdf":
                                 result = CleansingTools.extract_from_pdf(inputs["pdf_path"], inputs.get("pages"))
                                 result = {"text": result}
                             elif tool_name == "parse_csv_data":
+                                logger.info(f"[TOOL_EXEC] {task_id}: parse_csv_data - CSV content length: {len(inputs['csv_content'])}")
                                 df = CleansingTools.parse_csv_data(inputs["csv_content"], inputs.get("delimiter", ","))
-                                result = {"dataframe": df, "shape": str(df.shape)}
+                                # Register DataFrame
+                                df_key = f"df_{len(dataframe_registry)}"
+                                dataframe_registry[df_key] = df
+                                logger.info(f"[TOOL_RESULT] {task_id}: parse_csv_data - DataFrame: {df_key}, Shape: {df.shape}")
+                                result = {"dataframe_key": df_key, "shape": str(df.shape)}
                             elif tool_name == "parse_json_data":
                                 result = CleansingTools.parse_json_data(inputs["json_content"])
                                 result = {"data": result}
@@ -602,6 +626,19 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                 candidate_artifacts[key] = value
                 continue
             
+            # Include ML prediction results (linear regression, etc.)
+            if isinstance(value, dict) and 'prediction' in value and 'model_type' in value:
+                candidate_artifacts[key] = value
+                continue
+            
+            # Include call_llm results (often the final filtered/computed answer)
+            if isinstance(value, (str, int, float)) and not key.startswith(('html', 'reviews', 'blacklist')):
+                # Check if this looks like a computed result (count, answer, etc.)
+                result_keywords = ('count', 'answer', 'result', 'valid', 'filtered', 'computed', 'final')
+                if any(keyword in key.lower() for keyword in result_keywords):
+                    candidate_artifacts[key] = value
+                    continue
+            
             # Include vision results
             if isinstance(value, dict) and ('vision_result' in value or 'ocr_text' in value or 'result' in value):
                 # Check if it's from a vision/image tool
@@ -834,21 +871,6 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
                 final_answer = final_answer['text']
                 logger.info(f"[ARTIFACT_EXTRACTION] Extracted: {str(final_answer)[:100]}...")
         
-        # Extract secret code/value from rendered text patterns
-        if isinstance(final_answer, str):
-            # Pattern: "The secret code is: 9876" or "Secret code is 1371" etc.
-            secret_patterns = [
-                r'(?:secret code|code|answer|value)\s*(?:is|:)\s*[:\-]?\s*(\d+)',
-                r'(?:secret code|code|answer|value)\s*[:\-]\s*[:\-]?\s*(\S+)',
-            ]
-            for pattern in secret_patterns:
-                match = re.search(pattern, final_answer, re.IGNORECASE)
-                if match:
-                    extracted_value = match.group(1)
-                    logger.info(f"[ARTIFACT_EXTRACTION] Detected secret code pattern, extracting: {extracted_value}")
-                    final_answer = extracted_value
-                    break
-        
         elif isinstance(final_answer, str) and (final_answer.startswith("{'") or final_answer.startswith('{"')):
             # String representation of a dict - try to extract 'text'
             logger.info(f"[ARTIFACT_EXTRACTION] Detected string dict representation, extracting 'text'...")
@@ -860,37 +882,6 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
                     logger.info(f"[ARTIFACT_EXTRACTION] Extracted text from dict string: {str(final_answer)[:100]}...")
             except (ValueError, SyntaxError):
                 logger.info(f"[ARTIFACT_EXTRACTION] Could not parse dict string, using as-is")
-        
-        # Parse numbers or codes from natural language responses
-        if isinstance(final_answer, str):
-            # Check for pattern "Secret code is X" or similar
-            # Try specific patterns first
-            patterns = [
-                r'Secret code is (\d+)',  # "Secret code is 1371"
-                r'code is (\d+)',  # "code is 1371"
-                r'secret is (\d+)',  # "secret is 1371"
-                r'answer is (\d+)',  # "answer is 1371"
-                r'value is (\d+)',  # "value is 1371"
-            ]
-            
-            matched = False
-            for pattern in patterns:
-                match = re.search(pattern, final_answer, re.IGNORECASE)
-                if match:
-                    extracted_value = match.group(1)
-                    logger.info(f"[ANSWER_PARSING] Extracted '{extracted_value}' from: {final_answer[:100]}")
-                    final_answer = extracted_value
-                    matched = True
-                    break
-            
-            # If no pattern matched but answer looks like natural language with numbers, extract first number
-            if not matched and len(final_answer) > 20:
-                numbers = re.findall(r'\b\d+\b', final_answer)
-                if numbers:
-                    # If text contains phrases like "and not", take first number as likely answer
-                    if "and not" in final_answer.lower() or "not" in final_answer.lower():
-                        logger.info(f"[ANSWER_PARSING] Found 'not' pattern, extracting first number: {numbers[0]} from: {final_answer[:100]}")
-                        final_answer = numbers[0]
         
         if not final_answer and len(all_tasks) == 0:
             logger.info("Plan has no tasks and no artifact reference, providing default answer")

@@ -226,22 +226,31 @@ def check_completion_fast(artifacts: Dict[str, Any], page_text: str = "", transc
             if 'pattern_type' in artifact_value and 'count' in artifact_value:
                 # Check if page asks for count/number
                 count_keywords = ['how many', 'count', 'number of', 'total']
-                if any(keyword in page_text.lower() for keyword in count_keywords):
+                # Check if additional operations are needed (filtering, comparison, blacklist, etc.)
+                multi_step_keywords = ['not in', 'blacklist', 'filter', 'exclude', 'except', 'remove', 'greater', 'less', 'compare']
+                
+                has_count_question = any(keyword in page_text.lower() for keyword in count_keywords)
+                needs_additional_ops = any(keyword in page_text.lower() for keyword in multi_step_keywords)
+                
+                # Only fast-complete if it's a simple count question without filtering
+                if has_count_question and not needs_additional_ops:
                     logger.info(f"[FAST_CHECK] Pattern extraction count found in {artifact_key}")
                     return {"complete": True, "reason": "pattern_count_present"}
-                if text_result and isinstance(text_result, str) and len(text_result) > 10:
-                    logger.info(f"[FAST_CHECK] Vision/OCR text found in {artifact_key}")
-                    return {"complete": True, "reason": "vision_text_present"}
     
-    # 2. EXTRACTED VALUES - likely done!
+    # 2. EXTRACTED VALUES - likely done! (but check for multi-step operations)
     extracted_artifacts = [k for k in artifacts.keys() if k.startswith('extracted_')]
     if extracted_artifacts:
-        logger.info(f"[FAST_CHECK] Found extracted artifacts: {extracted_artifacts}")
-        return {
-            "complete": True,
-            "reason": f"Extracted values found: {extracted_artifacts}",
-            "needs_more": False
-        }
+        # Check if additional operations are needed (filtering, comparison, etc.)
+        multi_step_keywords = ['not in', 'blacklist', 'filter', 'exclude', 'except', 'remove', 'greater', 'less', 'compare']
+        needs_additional_ops = any(keyword in page_text.lower() for keyword in multi_step_keywords)
+        
+        if not needs_additional_ops:
+            logger.info(f"[FAST_CHECK] Found extracted artifacts: {extracted_artifacts}")
+            return {
+                "complete": True,
+                "reason": f"Extracted values found: {extracted_artifacts}",
+                "needs_more": False
+            }
     
     # 2b. RENDERED PAGES WITH TEXT - likely done for scraping tasks!
     rendered_artifacts = [k for k in artifacts.keys() if k.startswith('rendered_')]
