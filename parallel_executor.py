@@ -63,7 +63,24 @@ def build_dependency_graph(tasks: List[Dict[str, Any]], artifacts: Dict[str, Any
         tool_name = task.get("tool_name", "")
         
         # Track what this task produces
-        task_produces[task_id] = {p["key"] for p in produces}
+        # Handle both old format (list of dicts) and new format (list of strings)
+        if produces:
+            if isinstance(produces, list):
+                if len(produces) > 0 and isinstance(produces[0], dict):
+                    # Old format: [{"key": "artifact_name", ...}]
+                    task_produces[task_id] = {p["key"] for p in produces if isinstance(p, dict) and "key" in p}
+                else:
+                    # New format: ["artifact_name"] or mixed
+                    task_produces[task_id] = {p if isinstance(p, str) else p.get("key", "") for p in produces if p}
+            elif isinstance(produces, str):
+                # Single string instead of list
+                logger.warning(f"[PARALLEL] Task {task_id} has string 'produces': {produces}, expected list")
+                task_produces[task_id] = {produces}
+            else:
+                logger.warning(f"[PARALLEL] Task {task_id} has unexpected 'produces' type: {type(produces)}")
+                task_produces[task_id] = set()
+        else:
+            task_produces[task_id] = set()
         
         # Track dataframe-producing tasks
         if tool_name in ["parse_csv", "parse_excel", "parse_json_file", "parse_html_tables", "dataframe_ops"]:

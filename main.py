@@ -16,6 +16,10 @@ from models import QuizRun
 from executor import run_pipeline
 from test_quizzes import router as test_router
 
+# Manual override storage (in-memory) - queue of answers to try
+# Structure: list of {"answer": answer, "timestamp": time}
+manual_override_queue: list = []
+
 # Windows compatibility for asyncio
 if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
@@ -44,6 +48,12 @@ class VerifyPayload(BaseModel):
     
     class Config:
         extra = "allow"
+
+
+class ManualOverridePayload(BaseModel):
+    """Manual answer override - adds answer to queue"""
+    secret: str
+    answer: Any  # Can be string, number, dict, etc.
 
 
 @app.exception_handler(ValidationError)
@@ -89,7 +99,7 @@ async def solve(payload: VerifyPayload):
     # Start pipeline with timing
     logger.info(f"[PIPELINE_START] Beginning quiz solving pipeline")
     started = time.time()
-    pipeline_result = await run_pipeline(payload.email, str(payload.url))
+    pipeline_result = await run_pipeline(payload.email, str(payload.url), manual_override_queue)
     duration = time.time() - started
     logger.info(f"[PIPELINE_END] Pipeline completed in {duration:.2f}s - Success: {pipeline_result.get('success')}")
     
@@ -125,6 +135,8 @@ async def root():
         "version": "2.0",
         "endpoints": {
             "POST /solve": "Solve a quiz",
+            "POST /override": "Set manual answer override for a quiz URL",
+            "DELETE /override": "Clear manual answer override",
             "GET /health": "Health check",
             "GET /test-quiz/{quiz_type}": "Get test quiz (literal/compute/web_api/...)",
             "POST /test-quiz/{quiz_type}/submit": "Submit answer for test quiz",
@@ -133,4 +145,46 @@ async def root():
             "GET /test-page/dynamic": "Mock JS-rendered page",
             "GET /": "This endpoint"
         }
+    }
+
+
+@app.post("/override")
+async def set_override(payload: ManualOverridePayload):
+    """Add a manual answer to the queue - will be tried on current quiz"""
+    if payload.secret != SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    
+    override_entry = {
+        "answer": payload.answer,
+        "timestamp": time.time()
+    }
+    manual_override_queue.append(override_entry)
+    logger.info(f"[MANUAL_OVERRIDE] Added answer to queue (position {len(manual_override_queue)}): {payload.answer}")
+    
+    return {
+        "status": "ok",
+        "message": f"Answer added to queue (position {len(manual_override_queue)}) - will try on current quiz",
+        "answer": payload.answer,
+        "queue_position": len(manual_override_queue)
+    }
+
+
+@app.delete("/override")
+async def clear_override(secret: str):
+    """Clear all manual answer overrides from queue"""
+    if secret != SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    
+    count = len(manual_override_queue)
+    manual_override_queue.clear()
+    logger.info(f"[MANUAL_OVERRIDE] Cleared {count} answers from queue")
+    return {"status": "ok", "message": f"Cleared {count} answers from queue"}
+
+
+@app.get("/override/status")
+async def get_override_status():
+    """Get status of manual override queue"""
+    return {
+        "queue_length": len(manual_override_queue),
+        "answers": manual_override_queue
     }

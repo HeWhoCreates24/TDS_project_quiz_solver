@@ -11,6 +11,84 @@ def get_tool_usage_examples() -> str:
     This ensures prompts stay in sync with available tools.
     """
     return """
+═══════════════════════════════════════════════════════════════════════════════
+║                     WORKFLOW DECISION TREE - START HERE                     ║
+═══════════════════════════════════════════════════════════════════════════════
+
+**STEP 1: What type of data are you working with?**
+
+┌─ Tabular data (CSV, Excel, structured JSON)
+│  ├─ Has rows and columns? → parse_csv / parse_excel / parse_json_file
+│  ├─ Need to TRANSFORM data (rename columns, format values, complex changes)? → call_llm
+│  ├─ Need to filter rows? → dataframe_ops(op="filter")
+│  ├─ Need column totals? → dataframe_ops(op="sum"/"mean") OR calculate_statistics
+│  ├─ Need group totals? → dataframe_ops(op="groupby")
+│  └─ Need to reshape structure? → dataframe_ops(op="pivot"/"melt")
+│
+┌─ Nested JSON / API response (not tabular)
+│  ├─ Simple extraction? → call_llm with specific prompt
+│  ├─ Complex navigation? → call_llm with path description
+│  └─ Want to make it tabular? → parse_json_file (if it's array of objects)
+│
+┌─ Image with text/numbers
+│  └─ Always: download_file → analyze_image(task="ocr")
+│
+┌─ Audio file
+│  └─ Always: download_file → transcribe_audio
+│     └─ If transcription has numbers/values: → extract_patterns or call_llm
+│
+┌─ HTML page
+│  ├─ Static content? → fetch_text
+│  ├─ Dynamic (JavaScript)? → render_js_page
+│  ├─ Has Base64 data? → render_js_page → extract_html_text(selector) → decode_base64
+│  └─ Has tables? → render_js_page → parse_html_tables
+│
+└─ PDF document
+   └─ Has tables? → download_file → parse_pdf_tables
+
+**STEP 2: Examine metadata BEFORE choosing next operation**
+
+After parsing, you get metadata like:
+{
+  "dataframe_key": "df_0",
+  "columns": ["ID", "Name", "Value"],  ← Use EXACT names (case-sensitive!)
+  "shape": [100, 3],
+  "sample_data": [[1, "Alice", 100], ...]
+}
+
+- Columns tell you EXACT names to use ("ID" not "id")
+- Sample shows data types and patterns
+- Shape tells you rows × columns
+
+**STEP 3: Choose operation based on what you need**
+
+┌─ I need: A subset of rows
+│  └─ Use: dataframe_ops(op="filter", params={"condition": "Value >= 100"})
+│
+┌─ I need: Specific columns only
+│  └─ Use: dataframe_ops(op="select", params={"columns": ["ID", "Name"]})
+│
+┌─ I need: Total/average of a column
+│  └─ Use: dataframe_ops(op="sum"/"mean", params={"column": "Value"})
+│
+┌─ I need: Per-group totals (e.g., sum by category)
+│  └─ Use: dataframe_ops(op="groupby", params={"by": ["Category"], "aggregation": {"Value": "sum"}})
+│
+┌─ I need: Row with max value in column X, return value from column Y
+│  └─ Use: dataframe_ops(op="idxmax", params={"value_column": "X", "label_column": "Y"})
+│
+└─ I need: Rows as columns (pivot table)
+   └─ Use: dataframe_ops(op="pivot", params={"index": "row_var", "columns": "col_var", "values": "data"})
+
+**STEP 4: Reference artifacts correctly**
+
+- Parse creates artifact "df_0" with metadata {"dataframe_key": "df_2", ...}
+- In next tool, use: {"dataframe_key": "{{df_0}}"} ← Template markers required!
+- Executor resolves {{df_0}} → extracts "df_2" → passes to tool
+- Each operation creates NEW artifact (df_0 → filter → df_1)
+
+════════════════════════════════════════════════════════════════════════════════
+
 AVAILABLE TOOLS AND USAGE:
 
 Web & Data Fetching:
@@ -58,7 +136,127 @@ Data Transformation:
   * Row operations: filter, sum, mean, count, select
   * Aggregation: groupby (with 'by' and 'aggregation' parameters)
   * Shape operations: pivot, melt, transpose
+  * Sorting/slicing: sort (by column), head (first N rows), tail (last N rows)
   * Row extraction: idxmax, idxmin (find row with max/min value and extract label)
+  
+  ═══════════════════════════════════════════════════════════════════════════════
+  ║ DATAFRAME COLUMN HANDLING - READ THIS FIRST BEFORE USING ANY DATAFRAME OPS ║
+  ═══════════════════════════════════════════════════════════════════════════════
+  
+  **STEP 1: EXAMINE DATAFRAME METADATA**
+  After parsing (parse_csv, parse_excel, parse_json_file), you receive metadata:
+  {
+    "dataframe_key": "df_0",
+    "columns": ["ID", "Name", "JoinDate", "Value"],  ← EXACT column names
+    "sample_data": [[1, "Alice", "2024-01-15", 100], [2, "Bob", "2024-02-20", 200]]
+  }
+  
+  **STEP 2: USE EXACT COLUMN NAMES (CASE-SENSITIVE)**
+  - Column names are CASE-SENSITIVE: "Value" ≠ "value" ≠ "VALUE"
+  - Use the EXACT names from the 'columns' field in metadata
+  - Example: If columns=["ID", "Name"], use "ID" not "id" or "Id"
+  
+  **STEP 3: CHOOSE THE RIGHT OPERATION**
+  
+  A) FILTERING DATA (when you need a subset of rows)
+     {"op": "filter", "params": {
+       "dataframe_key": "{{df_0}}",
+       "condition": "Value >= 100"  ← Use EXACT column name from metadata
+     }}
+     - Operators: >=, <=, >, <, ==, !=
+     - Format: "ColumnName operator value" (e.g., "Value >= 100", "Name == 'Alice'")
+     - Creates NEW dataframe (df_0 → filter → df_1)
+     - DO NOT filter for null/empty unless explicitly asked - work with data as-is
+  
+  B) SELECTING COLUMNS (when you need specific columns)
+     {"op": "select", "params": {
+       "dataframe_key": "{{df_0}}",
+       "columns": ["ID", "Value"]  ← Array of EXACT column names
+     }}
+     - Returns only specified columns
+     - Preserves all rows
+  
+  C) AGGREGATING VALUES (when you need totals/averages)
+     {"op": "sum", "params": {"dataframe_key": "{{df_0}}", "column": "Value"}}
+     {"op": "mean", "params": {"dataframe_key": "{{df_0}}", "column": "Value"}}
+     - Returns single numeric result
+  
+  D) GROUPING AND AGGREGATING (when you need per-category totals)
+     ════════════════════════════════════════════════════════════════
+     ║ CRITICAL: TWO FORMATS - USE THE RIGHT ONE!                   ║
+     ════════════════════════════════════════════════════════════════
+     
+     FORMAT 1 - SIMPLE (Keep Original Column Names):
+     {"op": "groupby", "params": {
+       "dataframe_key": "{{df_0}}",
+       "by": ["customer_id"],
+       "aggregation": {"amount": "sum"}  ← Key is EXISTING column name
+     }}
+     → Result columns: ["customer_id", "amount"]
+     → Use when you DON'T need to rename the result column
+     
+     FORMAT 2 - NAMED (Rename Result Columns):
+     {"op": "groupby", "params": {
+       "dataframe_key": "{{df_0}}",
+       "by": ["customer_id"],
+       "aggregation": {"total": ["amount", "sum"]}  ← Array: [source_col, function]
+     }}
+     → Result columns: ["customer_id", "total"]
+     → Use when you NEED to rename (e.g., 'amount' → 'total')
+     
+     ════════════════════════════════════════════════════════════════
+     ║ COMMON MISTAKE - WRONG FORMAT USAGE:                         ║
+     ════════════════════════════════════════════════════════════════
+     Given: orders.csv with columns ['customer_id', 'order_date', 'amount']
+     
+     ❌ WRONG - Format 1 with non-existent column:
+        {"aggregation": {"total": "sum"}}
+        → ERROR: "Column(s) ['total'] do not exist"
+        → You tried to aggregate a column called 'total' but it doesn't exist!
+     
+     ✅ CORRECT - Format 2 to create 'total' column:
+        {"aggregation": {"total": ["amount", "sum"]}}
+        → Aggregates 'amount' (which exists) and names result 'total'
+     
+     ✅ ALSO CORRECT - Format 1 to keep 'amount' name:
+        {"aggregation": {"amount": "sum"}}
+        → Aggregates 'amount' and keeps the name 'amount'
+     
+     ════════════════════════════════════════════════════════════════
+     
+     - Aggregation functions: "count", "sum", "mean", "min", "max", "median"
+     - Returns dataframe with grouped columns as regular columns (not index)
+     - To get top N: Chain operations → groupby → sort → head
+       Example: groupby → sort(by='total', ascending=False) → head(n=3)
+  
+  **COMMON MISTAKES TO AVOID:**
+  ❌ Using lowercase when column is uppercase: "value" when it's "Value"
+  ❌ Using SQL-style conditions: "WHERE Value > 100" (just use "Value > 100")
+  ❌ Using unsupported operators: "is", "is not", "not", "AND", "OR"
+  ❌ Filtering nulls unnecessarily: Only filter if task explicitly requires it
+  ❌ Hardcoding registry keys: Use {{df_0}} not "df_2"
+  
+  E) SORTING DATA (when you need ordered results)
+     {"op": "sort", "params": {
+       "dataframe_key": "{{df_0}}",
+       "by": "Value",  ← Column name or list of columns
+       "ascending": False  ← False for descending (largest first)
+     }}
+     - Returns dataframe sorted by specified column(s)
+     - ascending: True (smallest first) or False (largest first)
+  
+  F) TAKING FIRST/LAST ROWS (when you need top N or bottom N)
+     {"op": "head", "params": {"dataframe_key": "{{df_0}}", "n": 3}}  ← First 3 rows
+     {"op": "tail", "params": {"dataframe_key": "{{df_0}}", "n": 5}}  ← Last 5 rows
+     - Use after sort to get top/bottom N by value
+     - Example: sort(by='amount', ascending=False) then head(n=3) = top 3 by amount
+  
+  **WORKFLOW PATTERN:**
+  1. Parse data → Examine columns field in metadata
+  2. Choose operation based on task (filter/select/groupby/sort/head/aggregate)
+  3. Use EXACT column names from metadata
+  4. Reference dataframe with {{artifact_name}}
+  
   * Groupby example: {"op": "groupby", "params": {"dataframe_key": "{{df_0}}", "by": ["region"], "aggregation": {"revenue": "median"}}}
     - Parameter 'by': Array of column names to group by
     - Parameter 'aggregation': String like "count" OR dict like {"revenue": "median"}. Default: "count"
@@ -69,6 +267,7 @@ Data Transformation:
     - Use when you need the LABEL (e.g., "West") not the VALUE (e.g., 9050)
   * Pivot example: {"op": "pivot", "params": {"dataframe_key": "{{df_0}}", "index": "category", "columns": "month", "values": "sales"}}
   * Sum example: {"op": "sum", "params": {"dataframe_key": "{{df_1}}", "column": "sales"}}
+  * Select example: {"op": "select", "params": {"dataframe_key": "{{df_0}}", "columns": ["ID", "Name", "Value"]}}
   * Filter creates NEW dataframe: df_0 → filter → df_1
 
 - calculate_statistics(dataframe, stats, columns): Calculate sum, mean, median, std, etc.
@@ -116,14 +315,139 @@ Utilities:
   * Example: Find product with highest price from JSON → use call_llm
   * For structured dataframes, dataframe_ops or calculate_statistics provide specialized operations
   
-  **HOW TO WRITE EFFECTIVE call_llm PROMPTS:**
-  * Be SPECIFIC about output format: "Return only the product ID as a plain string"
-  * NOT generic: "Find the product with highest price and return its id" ❌
-  * SPECIFIC: "Extract the 'id' field from the product with the highest 'price' value. Return ONLY the id value (e.g., 'P004'), not JSON, not an object, just the raw string value." ✅
-  * System prompt should specify: "Extract the product id. Return ONLY the id value like 'P004', not wrapped in JSON."
-  * Bad example: LLM returns {"id": "P004"} when you wanted just "P004"
-  * Good example: LLM returns "P004" because prompt was explicit
-  * Key principle: Tell the LLM EXACTLY what format you want in the response
+  ═══════════════════════════════════════════════════════════════════════════════
+  ║              CALL_LLM PROMPT ENGINEERING - CRITICAL PATTERNS                ║
+  ═══════════════════════════════════════════════════════════════════════════════
+  
+  **PRINCIPLE: Be HYPER-SPECIFIC about output format**
+  
+  The LLM will return EXACTLY what you describe. If you're vague, you'll get:
+  - JSON objects when you wanted plain strings
+  - Explanations when you wanted just the answer
+  - Multiple values when you wanted one
+  
+  **PATTERN 1: Extracting Single Values**
+  ❌ BAD: "Find the product with highest price and return its id"
+     Result: {"id": "P004", "price": 299.99} ← Unwanted JSON wrapper
+  
+  ✅ GOOD:
+     prompt: "Here is product data: {{json_data}}. Extract the 'id' field from the product with the highest 'price' value. Return ONLY the id value itself (like 'P004'), not JSON, not an object, not a sentence - just the raw id string."
+     system_prompt: "You extract data values. Return ONLY the requested value with no formatting, no JSON, no explanation."
+     Result: "P004" ← Perfect!
+  
+  **PATTERN 2: Numeric Calculations**
+  ❌ BAD: "Calculate the total revenue"
+     Result: "The total revenue is $15,432.50" ← Unwanted text
+  
+  ✅ GOOD:
+     prompt: "Calculate the sum of all 'price' values in this data: {{json_data}}. Return ONLY the numeric result (e.g., 15432.50), no dollar signs, no commas, no text."
+     system_prompt: "You are a calculator. Return ONLY the numeric answer."
+     Result: "15432.50" ← Perfect!
+  
+  **PATTERN 2b: Calculations with Explicit Formulas**
+  ❌ BAD: "Calculate F1 score for each run"
+     Result: Uses wrong formula or makes arithmetic errors
+  
+  ✅ GOOD - CRITICAL: When quiz provides a formula, USE IT EXACTLY:
+     prompt: "Given this data: {{{{data}}}}
+             
+             For each run, calculate metric using THIS EXACT FORMULA:
+             F1 = 2*tp / (2*tp + fp + fn)
+             
+             Example calculation (show your work):
+             - If tp=9, fp=1, fn=1: F1 = 2*9 / (2*9 + 1 + 1) = 18/20 = 0.9
+             
+             Steps:
+             1. For EACH run, calculate F1 for EACH label using the formula above
+             2. Average F1 scores across labels to get macro-F1
+             3. Round macro-F1 to 4 decimal places
+             
+             Find the run with HIGHEST macro-F1.
+             
+             Return ONLY this JSON (no explanations, no steps in output):
+             {{'run_id': 'runX', 'macro_f1': 0.XXXX}}
+             
+             CRITICAL: Use the EXACT formula provided. Do NOT use precision/recall formulas."
+     system_prompt: "Follow formulas EXACTLY as given. Show arithmetic step-by-step in your thinking, but return ONLY the final JSON result."
+     Result: {{'run_id': 'runC', 'macro_f1': 0.8175}} ← Perfect!
+  
+  **KEY: ALWAYS specify exact output format - JSON structure, field names, no explanations**
+  
+  **KEY: ALWAYS specify exact output format - JSON structure, field names, no explanations**
+  
+  **PATTERN 3: Finding Maximum/Minimum**
+  ✅ TEMPLATE:
+     prompt: "From this JSON array: {{data}}, find the item with the maximum '{{field}}' value and return its '{{target_field}}' field. Return ONLY that value, nothing else."
+     system_prompt: "Extract the requested field value. Return it raw with no JSON wrapping."
+  
+  **PATTERN 4: Filtering/Counting**
+  ✅ TEMPLATE:
+     prompt: "Count how many items in this array have '{{field}}' > {{threshold}}: {{data}}. Return ONLY the count as a number."
+     system_prompt: "Return ONLY the count as a plain number."
+  
+  **PATTERN 5: Complex JSON Navigation**
+  ✅ TEMPLATE:
+     prompt: "Navigate this nested JSON: {{json}}. Extract the value at path {{path}}. Return ONLY that value with no additional formatting."
+     Example: "Extract data.users[0].email from {{json}}. Return ONLY the email address."
+  
+  **KEY RULES:**
+  1. Always say "Return ONLY [what you want]" in the prompt
+  2. Explicitly list what NOT to include: "no JSON", "no explanation", "no text"
+  3. Give an example format: "(e.g., 'P004')" or "(e.g., 42.5)"
+  4. Use system_prompt to reinforce: "You return raw values only"
+  5. For numbers: Specify "no commas, no dollar signs, no units"
+  6. For strings: Specify "no quotes, no brackets"
+  
+  **WHEN TO USE call_llm vs DATAFRAME_OPS:**
+  - Use call_llm: For JSON dicts, nested objects, text data, simple queries, DATA TRANSFORMATION TASKS
+  - Use dataframe_ops: For tabular data with rows/columns after parse_csv/parse_json_file
+  
+  **DATA TRANSFORMATION USE CASES:**
+  When task requires transforming data structure, format, or content:
+  - Renaming columns (e.g., "ID" → "id", camelCase → snake_case)
+  - Reformatting values (e.g., dates "01/15/24" → "2024-01-15", strings → integers)
+  - Complex reshaping beyond pivot/melt
+  - Combining multiple transformation steps
+  
+  **Pattern for data transformation:**
+  1. Parse CSV → Get dataframe with sample_data in artifact
+  2. Use call_llm referencing the dataframe artifact - executor will inject full data
+  3. LLM transforms the data and returns result
+  
+  **CRITICAL: How to access dataframe data in call_llm:**
+  When you need to transform dataframe data, reference the artifact in the prompt.
+  The prompt should ask call_llm to work with "the dataframe from {{df_0}}".
+  The executor will automatically include the dataframe sample in the context.
+  
+  **Example - Column renaming and date formatting:**
+  ```
+  {
+    "tool_name": "call_llm",
+    "inputs": {
+      "prompt": "I have a dataframe with this structure: {{df_0}}. Transform ALL the data as follows: 1) Convert column names to snake_case (ID→id, Name→name, Joined→joined, Value→value), 2) Standardize ALL dates to YYYY-MM-DD format (handle MM/DD/YY, YYYY-MM-DD, and 'D Mon YYYY' formats), 3) Ensure all numeric values are integers, 4) Sort by id ascending. Return ONLY the complete JSON array with all rows, no explanation.",
+      "system_prompt": "You transform data structures. Return only valid JSON arrays with no additional text."
+    },
+    "produces": ["transformed_data"]
+  }
+  ```
+  
+  **KEY POINTS:**
+  - Say "ALL the data" or "complete data" to avoid partial responses
+  - Reference {{df_0}} in prompt - metadata will be injected
+  - Be explicit about handling ALL date formats present in the data
+  - Request "complete JSON array with all rows" to prevent truncation
+  - System prompt reinforces: return ONLY JSON, no explanation
+  
+  **When dataframe_ops IS appropriate:**
+  - Filtering rows: "Keep only rows where Value > 100"
+  - Selecting columns: "Keep only ID and Name columns"
+  - Aggregating: "Sum all values", "Calculate mean by category"
+  - Grouping: "Total sales by region"
+  - Pivoting: "Reshape categories into columns"
+  
+  **Key distinction:**
+  - call_llm: Transforms data CONTENT and STRUCTURE (renaming, formatting, complex logic)
+  - dataframe_ops: Operates on EXISTING structure (filter, select, aggregate, reshape shape)
 
 - zip_base64(paths): Create zip archives
 - geospatial_analysis(dataframe, analysis_type, kwargs): Distance, geocoding, spatial joins
@@ -190,21 +514,27 @@ WRONG:   {"dataframe_key": "df_2", ...}                                ❌ Hardc
 
 COMMON WORKFLOWS:
 
-1. API FETCH WITH NESTED FIELD:
+1. DATA TRANSFORMATION (renaming, formatting, complex changes):
+   Pattern: parse_csv → call_llm with transformation instructions
+   Example task: "Normalize CSV: convert columns to snake_case, standardize dates to ISO-8601, sort by id"
+   Solution: parse_csv gets data → call_llm transforms structure/format → return JSON
+   Key point: Use call_llm for content/format changes, not dataframe_ops
+   
+2. API FETCH WITH NESTED FIELD:
    Tool: fetch_from_api (NOT "call_api")
    Pattern: fetch_from_api returns {"status_code": 200, "data": {...}}
    Example task: Extract 'secret_code' from API response
    Solution: Use fetch_from_api, reference result with dot notation
    Key point: Artifact naming must match between produces and final_answer_spec
    
-2. VISUALIZATION + COUNT:
+3. VISUALIZATION + COUNT:
    Tool: create_chart (NOT dataframe_ops count)
    Pattern: create_chart returns {"chart_path": "...", "unique_categories": N}
    Example task: "Create bar chart and count how many categories"
    Solution: Use create_chart, reference .unique_categories field
    Key point: The unique_categories field automatically contains the count
    
-3. DATA TRANSFORMATION:
+4. DATA TRANSFORMATION:
    Tool: dataframe_ops with op="pivot"
    Pattern: Pivot restructures data shape (rows → columns)
    Example task: "Pivot by category and month, sum January sales"
@@ -212,7 +542,7 @@ COMMON WORKFLOWS:
    Then calculate_statistics on result: {"dataframe": "{{pivoted}}", "stats": ["sum"], ...}
    Key point: After pivot, month names become column names
 
-4. MACHINE LEARNING WORKFLOW:
+5. MACHINE LEARNING WORKFLOW:
    Tool: train_linear_regression
    Pattern: Parse CSV → Train model → Get prediction
    Example: {"dataframe_key": "{{df_0}}", "feature_columns": ["x"], "target_column": "y", "predict_x": {"x": 50}}
@@ -222,7 +552,7 @@ PARAMETER NAMING CONVENTIONS:
 - dataframe_ops: Use {"op": "...", "params": {"dataframe_key": "{{artifact}}", ...}}
   * CRITICAL: Parameter is "op" NOT "operation"
   * CRITICAL: Dataframe identifier goes in params.dataframe_key with template markers
-  * Works for ALL operations: filter, sum, mean, count, select, groupby, pivot, melt, transpose
+  * Works for ALL operations: filter, sum, mean, count, select, groupby, sort, head, tail, pivot, melt, transpose, idxmax, idxmin
   * Pivot example: {"op": "pivot", "params": {"dataframe_key": "{{df_0}}", "index": "category", "columns": "month", "values": "sales"}}
   * Sum example: {"op": "sum", "params": {"dataframe_key": "{{df_1}}", "column": "January"}}
   
@@ -591,81 +921,92 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "dataframe_ops",
-                "description": "Perform DataFrame operations: filter rows, calculate aggregations (sum/mean), select columns, group by categories, or reshape data (pivot/melt/transpose). Creates new DataFrames for operations that transform structure.",
+                "description": "Perform DataFrame operations on parsed tabular data. CRITICAL: Column names are CASE-SENSITIVE - always use exact names from dataframe metadata. Operations: filter rows by conditions, calculate aggregations (sum/mean/count), select specific columns, group by categories with aggregation, sort by columns, take first/last N rows (head/tail), reshape data (pivot/melt/transpose), or find rows with max/min values (idxmax/idxmin). Each operation creates a new DataFrame artifact.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "op": {
                             "type": "string",
-                            "description": "Operation type",
-                            "enum": ["filter", "sum", "mean", "count", "select", "groupby", "pivot", "melt", "transpose", "idxmax", "idxmin"]
+                            "description": "Operation to perform. Choose based on goal: 'filter' for row subsets, 'select' for column subsets, 'sum'/'mean' for single values, 'groupby' for per-category aggregation, 'pivot' for reshaping, 'idxmax'/'idxmin' for finding extreme values",
+                            "enum": ["filter", "sum", "mean", "count", "select", "groupby", "pivot", "melt", "transpose", "sort", "head", "tail", "idxmax", "idxmin"]
                         },
                         "params": {
                             "type": "object",
-                            "description": "Operation parameters",
+                            "description": "Parameters for the operation. Always include 'dataframe_key' using template syntax: {{artifact_name}}",
                             "properties": {
                                 "dataframe_key": {
                                     "type": "string",
-                                    "description": "DataFrame to operate on (e.g., 'df_0')"
+                                    "description": "Reference to parsed dataframe using template markers. Format: {{artifact_name}} where artifact_name is from parse tool output (e.g., {{df_0}}). Do NOT use raw registry keys or omit template markers."
                                 },
                                 "condition": {
                                     "type": "string",
-                                    "description": "For filter: Complete condition string with column name, operator, and value (e.g., '96903 >= 1371' or 'temperature > 25'). Include the full comparison value."
+                                    "description": "FOR FILTER ONLY. Complete condition with EXACT column name (case-sensitive!), comparison operator, and value. Format: 'ColumnName operator value'. Valid operators: >= <= > < == !=. Examples: 'Temperature > 25', 'ID >= 100', 'Name == Alice'. Use column names EXACTLY as shown in dataframe metadata."
                                 },
                                 "column": {
                                     "type": "string",
-                                    "description": "For sum/mean: column name to aggregate"
+                                    "description": "FOR SUM/MEAN ONLY. Column name to aggregate. Must match EXACT column name from metadata (case-sensitive). Example: If metadata shows 'Revenue', use 'Revenue' not 'revenue'."
                                 },
                                 "columns": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "For select: list of column names to select/keep"
+                                    "description": "FOR SELECT ONLY. Array of column names to keep. Must use EXACT column names from metadata (case-sensitive). Example: If metadata shows ['ID', 'Name', 'Value'], use ['ID', 'Name'] not ['id', 'name']."
                                 },
                                 "index": {
                                     "type": "string",
-                                    "description": "For pivot: column name to use as row index"
+                                    "description": "FOR PIVOT ONLY. Column name to use as row labels in pivoted result. Must match exact column name from metadata."
                                 },
                                 "columns": {
                                     "type": "string",
-                                    "description": "For pivot: column name whose values become new column headers"
+                                    "description": "FOR PIVOT ONLY. Column whose unique values become column headers in pivoted result. Must match exact column name from metadata."
                                 },
                                 "values": {
                                     "type": "string",
-                                    "description": "For pivot: column name containing the data values"
+                                    "description": "FOR PIVOT ONLY. Column containing the data values to fill the pivot table. Must match exact column name from metadata."
                                 },
                                 "id_vars": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "For melt: columns to use as identifier variables"
+                                    "description": "FOR MELT ONLY. Columns to keep as identifier variables (not unpivoted). Use exact column names from metadata."
                                 },
                                 "value_vars": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "For melt: columns to unpivot"
+                                    "description": "FOR MELT ONLY. Columns to unpivot into variable/value pairs. Use exact column names from metadata."
                                 },
                                 "var_name": {
                                     "type": "string",
-                                    "description": "For melt: name for the 'variable' column (default: 'variable')"
+                                    "description": "FOR MELT ONLY. Name for the new 'variable' column that will contain unpivoted column names. Optional, defaults to 'variable'."
                                 },
                                 "value_name": {
                                     "type": "string",
-                                    "description": "For melt: name for the 'value' column (default: 'value')"
+                                    "description": "FOR MELT ONLY. Name for the new 'value' column that will contain unpivoted values. Optional, defaults to 'value'."
                                 },
                                 "by": {
                                     "type": "array",
                                     "items": {"type": "string"},
-                                    "description": "For groupby: column names to group by (e.g., ['region'])"
+                                    "description": "FOR GROUPBY ONLY. Column names to group by. Must use EXACT column names from metadata. Example: ['Region', 'Category']. Result will have these columns plus aggregated columns."
                                 },
                                 "aggregation": {
-                                    "description": "For groupby: aggregation specification. Can be a string (e.g., 'count') or dict mapping columns to functions (e.g., {'revenue': 'median'}). Default: 'count'"
+                                    "description": "FOR GROUPBY ONLY. Aggregation specification. Can be: (1) String like 'count', 'sum', 'mean', 'min', 'max', 'median' to apply to all numeric columns, OR (2) Dict for column-specific aggregation. Dict format supports two styles: SIMPLE: {'column_name': 'function'} keeps original column name, example {'amount': 'sum'} → result has 'amount' column. NAMED: {'new_name': ['existing_column', 'function']} renames aggregated column, example {'total': ['amount', 'sum']} → result has 'total' column. CRITICAL: For simple format, dict keys MUST be existing columns. For named format, array's first element must be existing column. Use JSON arrays, not Python tuples. Defaults to 'count' if omitted."
+                                },
+                                "by": {
+                                    "description": "FOR SORT ONLY. Column name (string) or list of column names to sort by. Must use EXACT column names from metadata. Example: 'amount' or ['customer_id', 'amount']."
+                                },
+                                "ascending": {
+                                    "type": "boolean",
+                                    "description": "FOR SORT ONLY. Sort direction. True for ascending (smallest first), False for descending (largest first). Default: True."
+                                },
+                                "n": {
+                                    "type": "integer",
+                                    "description": "FOR HEAD/TAIL ONLY. Number of rows to return. Default: 5. Use head to get first N rows (top N after sorting), tail to get last N rows."
                                 },
                                 "value_column": {
                                     "type": "string",
-                                    "description": "For idxmax/idxmin: column to find max/min value in"
+                                    "description": "FOR IDXMAX/IDXMIN ONLY. Column to find maximum/minimum value in. Must use exact column name from metadata. Example: Find row with highest 'Revenue' → use 'Revenue'."
                                 },
                                 "label_column": {
                                     "type": "string",
-                                    "description": "For idxmax/idxmin: column to extract value from the row with max/min (e.g., region name)"
+                                    "description": "FOR IDXMAX/IDXMIN ONLY. Column to extract value from in the row with max/min. Returns the label/name, not the max/min value itself. Example: Find region with highest revenue → value_column='Revenue', label_column='Region' → returns region name like 'West'."
                                 }
                             },
                             "required": ["dataframe_key"]

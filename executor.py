@@ -44,12 +44,8 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
         if quiz_attempt:
             quiz_attempt.plan = plan
         
-        logger.info(f"Starting execution with iterative plan refinement (max {max_iterations} iterations)")
-        
         while iteration < max_iterations:
             iteration += 1
-            logger.info(f"=== Iteration {iteration} ===")
-            logger.info(f"Executing {len(all_tasks)} tasks")
             
             # Track last executed task for completion check optimization
             last_executed_task = None
@@ -60,14 +56,12 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
             # Execute tasks wave by wave
             for wave_idx, wave_tasks in enumerate(waves):
                 if len(wave_tasks) > 1:
-                    logger.info(f"[PARALLEL] Wave {wave_idx + 1}/{len(waves)}: Executing {len(wave_tasks)} tasks in parallel")
                     
                     # Check if all tasks in wave are I/O-bound (can be parallelized)
                     io_tools = ['download_file', 'fetch_text', 'render_js_page', 'scrape_with_javascript', 'fetch_from_api']
                     all_io_bound = all(task["tool_name"] in io_tools for task in wave_tasks)
                     
                     if all_io_bound:
-                        logger.info(f"[PARALLEL] All tasks are I/O-bound - running concurrently")
                         # Execute I/O tasks in parallel
                         async def execute_io_task(task):
                             task_id = task["id"]
@@ -75,19 +69,13 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             inputs = task.get("inputs", {})
                             
                             if tool_name == "download_file":
-                                logger.info(f"[TOOL_EXEC] {task_id}: download_file - URL: {inputs['url']}")
                                 result = await download_file(inputs["url"])
-                                logger.info(f"[TOOL_RESULT] {task_id}: download_file - File size: {result.get('size')} bytes")
                                 return (task, result)
                             elif tool_name == "fetch_text":
-                                logger.info(f"[TOOL_EXEC] {task_id}: fetch_text - URL: {inputs['url']}")
                                 result = await fetch_text(inputs["url"])
-                                logger.info(f"[TOOL_RESULT] {task_id}: fetch_text - Text length: {len(result.get('content', ''))}")
                                 return (task, result)
                             elif tool_name == "render_js_page":
-                                logger.info(f"[TOOL_EXEC] {task_id}: render_js_page - URL: {inputs['url']}")
                                 result = await render_page(inputs["url"])
-                                logger.info(f"[TOOL_RESULT] {task_id}: render_js_page - HTML length: {len(result.get('html', ''))}")
                                 return (task, result)
                             elif tool_name == "scrape_with_javascript":
                                 result = await ScrapingTools.scrape_with_javascript(inputs["url"], inputs.get("wait_for_selector"), inputs.get("timeout", 30000))
@@ -271,10 +259,29 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                             elif tool_name == "call_llm":
                                 logger.info(f"[TOOL_EXEC] {task_id}: call_llm")
                                 prompt = inputs["prompt"]
+                                
+                                # INFRASTRUCTURE: Inject artifact data into prompt
                                 for artifact_key in artifacts:
-                                    artifact_value = str(artifacts[artifact_key])
+                                    artifact_data = artifacts[artifact_key]
+                                    
+                                    # Smart injection based on artifact type
+                                    if isinstance(artifact_data, dict) and 'dataframe_key' in artifact_data:
+                                        # For dataframe artifacts, inject the actual data as JSON
+                                        df_key = artifact_data['dataframe_key']
+                                        if df_key in dataframe_registry:
+                                            df = dataframe_registry[df_key]
+                                            # Convert dataframe to JSON with records orientation
+                                            df_json = df.to_json(orient='records', date_format='iso')
+                                            artifact_value = f"Dataframe with {artifact_data['shape'][0]} rows and {artifact_data['shape'][1]} columns.\nColumns: {artifact_data['columns']}\nData: {df_json}"
+                                        else:
+                                            artifact_value = str(artifact_data)
+                                    else:
+                                        artifact_value = str(artifact_data)
+                                    
+                                    # Replace both {{key}} and {key} patterns
                                     prompt = re.sub(r'\{\{' + re.escape(artifact_key) + r'\}\}', artifact_value, prompt)
                                     prompt = re.sub(r'\{' + re.escape(artifact_key) + r'\}', artifact_value, prompt)
+                                
                                 system_prompt = inputs.get("system_prompt", "You are a helpful assistant.")
                                 result = await call_llm(prompt, system_prompt, inputs.get("max_tokens", 2000), inputs.get("temperature", 0))
                                 logger.info(f"[TOOL_RESULT] {task_id}: call_llm - Response: {result[:200]}...")
@@ -482,21 +489,47 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 continue
                             
                             # Store artifacts
+                            logger.info(f"[TASK_RESULT] ===== TASK {task_id} RESULT START =====")
+                            logger.info(f"[TASK_RESULT] Tool: {tool_name}")
+                            logger.info(f"[TASK_RESULT] Raw Result: {json.dumps(result, indent=2, default=str)[:2000]}")
+                            logger.info(f"[TASK_RESULT] Result Type: {type(result).__name__}")
+                            logger.info(f"[TASK_RESULT] ===== TASK {task_id} RESULT END =====")
+                            
                             for produce in produces:
                                 key = produce["key"]
                                 if isinstance(result, dict) and key in result:
                                     artifacts[key] = result[key]
+                                    logger.info(f"[ARTIFACT_STORED] {key} = {str(result[key])[:200]}... (from dict key)")
                                 elif isinstance(result, (str, int, float, bool, list)):
                                     if tool_name == "call_llm" and isinstance(result, str):
+                                        logger.info(f"[ARTIFACT_LLM] Original LLM result: {result[:500]}...")
                                         cleaned = result.strip()
+                                        # Remove markdown code fences (including ```json blocks)
+                                        cleaned = re.sub(r'^```[a-z]*\s*\n?', '', cleaned)
+                                        cleaned = re.sub(r'\n?```\s*$', '', cleaned)
+                                        cleaned = cleaned.strip()
+                                        # Remove common prefixes
                                         cleaned = re.sub(r'^.*?(?:is|are|be|found|extracted|as):\s*', '', cleaned, flags=re.IGNORECASE)
-                                        cleaned = re.sub(r'^```.*?\n?', '', cleaned)
-                                        cleaned = re.sub(r'\n?```$', '', cleaned)
+                                        # Remove trailing sentences
                                         cleaned = re.sub(r'\s*[.!?]\s+.*$', '', cleaned)
                                         cleaned = cleaned.strip()
+                                        logger.info(f"[ARTIFACT_LLM] Cleaned LLM result: {cleaned[:500]}...")
+                                        
+                                        # If result looks like JSON (array or object), parse and compact it
+                                        if cleaned and (cleaned.startswith('[') or cleaned.startswith('{')):
+                                            try:
+                                                # Parse JSON and re-serialize without whitespace (json imported at top)
+                                                parsed = json.loads(cleaned)
+                                                cleaned = json.dumps(parsed, separators=(',', ':'), ensure_ascii=False)
+                                                logger.info(f"[ARTIFACT_STORAGE] Compacted JSON for {key}")
+                                            except json.JSONDecodeError:
+                                                logger.info(f"[ARTIFACT_STORAGE] Result looks like JSON but failed to parse, using as-is")
+                                        
                                         artifacts[key] = cleaned if cleaned else result
+                                        logger.info(f"[ARTIFACT_STORED] {key} = {artifacts[key][:200] if isinstance(artifacts[key], str) else artifacts[key]} (from LLM)")
                                     else:
                                         artifacts[key] = result
+                                        logger.info(f"[ARTIFACT_STORED] {key} = {str(result)[:200]}... (direct value)")
                                 else:
                                     # For other dict results, store the entire dict
                                     if isinstance(result, dict):
@@ -524,6 +557,10 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 "produces": [p["key"] for p in produces],
                                 "iteration": iteration
                             })
+                            
+                            logger.info(f"[TASK_COMPLETE] Task {task_id} completed successfully")
+                            logger.info(f"[ARTIFACTS_CURRENT] Current artifacts: {list(artifacts.keys())}")
+                            logger.info(f"[TASK_END] ===== EXECUTING TASK {task_id} END =====\n")
                             
                         except Exception as e:
                             logger.error(f"Task {task_id} failed: {e}")
@@ -593,309 +630,345 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                 break
         
         # Extract final answer
+        logger.info(f"\n[FINAL_ANSWER] ===== BUILDING FINAL ANSWER START =====")
         final_answer = None
         final_spec = plan.get("final_answer_spec", {})
         page_text = page_data.get('text', '') if page_data else ''
         
-        logger.info("Preparing final answer for submission")
+        # Handle manual override - use injected answer directly
+        if final_spec.get("type") == "manual_override":
+            final_answer = final_spec.get("value")
+            logger.warning(f"[MANUAL_OVERRIDE] Using manually injected answer: {final_answer}")
+            logger.info(f"[MANUAL_OVERRIDE] Bypassing artifact selection - manual answer has highest priority")
         
-        # Collect ALL candidate artifacts (not just one)
-        candidate_artifacts = {}
+        # Only do artifact selection if no manual override
+        if final_answer is None:
+            logger.info(f"[FINAL_ANSWER] Answer spec: {json.dumps(final_spec, indent=2)}")
+            logger.info(f"[FINAL_ANSWER] Available artifacts ({len(artifacts)} total):")
+            for key, value in artifacts.items():
+                value_preview = str(value)[:300] if isinstance(value, str) else json.dumps(value, indent=2, default=str)[:300]
+                logger.info(f"[FINAL_ANSWER]   {key} = {value_preview}{'...' if len(str(value)) > 300 else ''}")
         
-        # Gather all potentially useful artifacts
-        for key in artifacts.keys():
-            value = artifacts[key]
+            logger.info("Preparing final answer for submission")
             
-            # Skip internal tracking artifacts
-            if key.startswith('_'):
-                continue
+            # Collect ALL candidate artifacts (not just one)
+            candidate_artifacts = {}
             
-            # Include statistics results
-            if isinstance(value, dict) and 'statistics' in value:
-                candidate_artifacts[key] = value
-                continue
-            
-            # Include successful transcription artifacts
-            if isinstance(value, dict) and value.get('success') and 'text' in value:
-                if 'audio_path' in value or 'method' in value or key.startswith('transcribe'):
-                    candidate_artifacts[key] = value
-                    continue
-            
-            # Include pattern extraction results
-            if isinstance(value, dict) and 'pattern_type' in value and 'count' in value:
-                candidate_artifacts[key] = value
-                continue
-            
-            # Include ML prediction results (linear regression, etc.)
-            if isinstance(value, dict) and 'prediction' in value and 'model_type' in value:
-                candidate_artifacts[key] = value
-                continue
-            
-            # Include call_llm results (often the final filtered/computed answer)
-            if isinstance(value, (str, int, float)) and not key.startswith(('html', 'reviews', 'blacklist')):
-                # Check if this looks like a computed result (count, answer, etc.)
-                result_keywords = ('count', 'answer', 'result', 'valid', 'filtered', 'computed', 'final')
-                if any(keyword in key.lower() for keyword in result_keywords):
-                    candidate_artifacts[key] = value
-                    continue
-            
-            # Include vision results
-            if isinstance(value, dict) and ('vision_result' in value or 'ocr_text' in value or 'result' in value):
-                # Check if it's from a vision/image tool
-                if 'vision' in key.lower() or 'image' in key.lower() or 'analyze_image' in key:
-                    candidate_artifacts[key] = value
-                    continue
-            
-            # Include dataframe operation results
-            if isinstance(value, dict) and 'result' in value and 'type' in value:
-                candidate_artifacts[key] = value
-                continue
-            
-            # Include chart/plot paths
-            if isinstance(value, dict) and ('chart_path' in value or 'plot_path' in value):
-                candidate_artifacts[key] = value
-                continue
-            
-            # Include reasonable string artifacts (not HTML/scripts)
-            if isinstance(value, str) and len(value) < 500 and len(value) > 2:
-                if not ('<' in value or 'script' in value.lower()):
-                    prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_', 'transcription_')
-                    if any(key.startswith(p) for p in prefixes):
-                        candidate_artifacts[key] = value
-                        continue
-            
-            # Include dict artifacts with 'text' field (e.g., rendered pages)
-            if isinstance(value, dict) and 'text' in value:
-                text_content = value.get('text', '')
-                if isinstance(text_content, str) and len(text_content.strip()) > 5:
-                    if not ('<' in text_content or 'script' in text_content.lower()):
-                        candidate_artifacts[key] = value
-                        continue
-        
-        # If we have multiple candidates, ask LLM to choose the correct one
-        if len(candidate_artifacts) > 1:
-            logger.info(f"[ARTIFACT_SELECTION] Found {len(candidate_artifacts)} candidate artifacts - asking LLM to select")
-            
-            # Prepare artifact summaries for LLM
-            artifact_summaries = {}
-            for key, value in candidate_artifacts.items():
-                if isinstance(value, dict):
-                    # For dicts, show structure
-                    if 'text' in value:
-                        artifact_summaries[key] = f"Dict with 'text': {str(value['text'])[:100]}..."
-                    elif 'statistics' in value:
-                        artifact_summaries[key] = f"Statistics result: {value}"
-                    elif 'count' in value and 'pattern_type' in value:
-                        artifact_summaries[key] = f"Pattern extraction: {value['pattern_type']} (count={value['count']})"
-                    elif 'success' in value and 'audio_path' in value:
-                        artifact_summaries[key] = f"Transcription: {value.get('text', '')}"
-                    else:
-                        artifact_summaries[key] = f"Dict: {str(value)[:100]}..."
-                else:
-                    artifact_summaries[key] = f"String: {str(value)[:100]}..."
-            
-            # Ask LLM which artifact contains the answer
-            selection_prompt = f"""You have multiple artifacts that could contain the answer to this question:
-
-Question: {page_text}
-
-Available artifacts:
-{json.dumps(artifact_summaries, indent=2)}
-
-Which artifact key contains the actual answer to the question? Respond with ONLY the artifact key name, nothing else."""
-
-            try:
-                selection_response = await call_llm(
-                    prompt=selection_prompt,
-                    system_prompt="You are selecting the correct artifact. Respond with ONLY the artifact key name."
-                )
-                selected_key = selection_response.strip()
+            # Gather all potentially useful artifacts
+            for key in artifacts.keys():
+                value = artifacts[key]
                 
-                # Validate the selection
-                if selected_key in candidate_artifacts:
-                    logger.info(f"[ARTIFACT_SELECTION] LLM selected: {selected_key}")
-                    final_answer = candidate_artifacts[selected_key]
-                else:
-                    # Fallback: use most recent
-                    logger.warning(f"[ARTIFACT_SELECTION] LLM selected invalid key '{selected_key}', using most recent")
+                # Skip internal tracking artifacts
+                if key.startswith('_'):
+                    continue
+                
+                    # Include statistics results
+                    if isinstance(value, dict) and 'statistics' in value:
+                        candidate_artifacts[key] = value
+                        continue
+            
+                # Include successful transcription artifacts
+                if isinstance(value, dict) and value.get('success') and 'text' in value:
+                    if 'audio_path' in value or 'method' in value or key.startswith('transcribe'):
+                        candidate_artifacts[key] = value
+                        continue
+            
+                # Include pattern extraction results
+                if isinstance(value, dict) and 'pattern_type' in value and 'count' in value:
+                    candidate_artifacts[key] = value
+                    continue
+            
+                # Include ML prediction results (linear regression, etc.)
+                if isinstance(value, dict) and 'prediction' in value and 'model_type' in value:
+                    candidate_artifacts[key] = value
+                    continue
+            
+                # Include call_llm results (often the final filtered/computed answer)
+                if isinstance(value, (str, int, float)) and not key.startswith(('html', 'reviews', 'blacklist')):
+                    # Check if this looks like a computed result (count, answer, etc.)
+                    result_keywords = ('count', 'answer', 'result', 'valid', 'filtered', 'computed', 'final')
+                    if any(keyword in key.lower() for keyword in result_keywords):
+                        candidate_artifacts[key] = value
+                        continue
+            
+                # Include vision results
+                if isinstance(value, dict) and ('vision_result' in value or 'ocr_text' in value or 'result' in value):
+                    # Check if it's from a vision/image tool
+                    if 'vision' in key.lower() or 'image' in key.lower() or 'analyze_image' in key:
+                        candidate_artifacts[key] = value
+                        continue
+            
+                # Include dataframe operation results
+                if isinstance(value, dict) and 'result' in value and 'type' in value:
+                    candidate_artifacts[key] = value
+                    continue
+            
+                # Include chart/plot paths
+                if isinstance(value, dict) and ('chart_path' in value or 'plot_path' in value):
+                    candidate_artifacts[key] = value
+                    continue
+            
+                # Include reasonable string artifacts (not HTML/scripts)
+                if isinstance(value, str) and len(value) < 500 and len(value) > 2:
+                    if not ('<' in value or 'script' in value.lower()):
+                        prefixes = ('extracted_', 'rendered_', 'scraped_', 'secret_', 'result_', 'answer_', 'transcription_')
+                        if any(key.startswith(p) for p in prefixes):
+                            candidate_artifacts[key] = value
+                            continue
+            
+                # Include dict artifacts with 'text' field (e.g., rendered pages)
+                if isinstance(value, dict) and 'text' in value:
+                    text_content = value.get('text', '')
+                    if isinstance(text_content, str) and len(text_content.strip()) > 5:
+                        if not ('<' in text_content or 'script' in text_content.lower()):
+                            candidate_artifacts[key] = value
+                            continue
+        
+            # If we have multiple candidates, ask LLM to choose the correct one
+            if len(candidate_artifacts) > 1:
+                logger.info(f"[ARTIFACT_SELECTION] Found {len(candidate_artifacts)} candidate artifacts - asking LLM to select")
+            
+                # Prepare artifact summaries for LLM
+                artifact_summaries = {}
+                for key, value in candidate_artifacts.items():
+                    if isinstance(value, dict):
+                        # For dicts, show structure
+                        if 'text' in value:
+                            artifact_summaries[key] = f"Dict with 'text': {str(value['text'])[:100]}..."
+                        elif 'statistics' in value:
+                            artifact_summaries[key] = f"Statistics result: {value}"
+                        elif 'count' in value and 'pattern_type' in value:
+                            artifact_summaries[key] = f"Pattern extraction: {value['pattern_type']} (count={value['count']})"
+                        elif 'success' in value and 'audio_path' in value:
+                            artifact_summaries[key] = f"Transcription: {value.get('text', '')}"
+                        else:
+                            artifact_summaries[key] = f"Dict: {str(value)[:100]}..."
+                    else:
+                        artifact_summaries[key] = f"String: {str(value)[:100]}..."
+            
+                # Ask LLM which artifact contains the answer
+                selection_prompt = f"""You have multiple artifacts that could contain the answer to this question:
+
+    Question: {page_text}
+
+    Available artifacts:
+    {json.dumps(artifact_summaries, indent=2)}
+
+    Which artifact key contains the actual answer to the question? Respond with ONLY the artifact key name, nothing else."""
+
+                try:
+                    selection_response = await call_llm(
+                        prompt=selection_prompt,
+                        system_prompt="You are selecting the correct artifact. Respond with ONLY the artifact key name."
+                    )
+                    selected_key = selection_response.strip()
+                
+                    # Validate the selection
+                    if selected_key in candidate_artifacts:
+                        logger.info(f"[ARTIFACT_SELECTION] LLM selected: {selected_key}")
+                        final_answer = candidate_artifacts[selected_key]
+                    else:
+                        # Fallback: use most recent
+                        logger.warning(f"[ARTIFACT_SELECTION] LLM selected invalid key '{selected_key}', using most recent")
+                        final_answer = list(candidate_artifacts.values())[-1]
+                        selected_key = list(candidate_artifacts.keys())[-1]
+                except Exception as e:
+                    logger.error(f"[ARTIFACT_SELECTION] LLM selection failed: {e}, using most recent")
                     final_answer = list(candidate_artifacts.values())[-1]
                     selected_key = list(candidate_artifacts.keys())[-1]
-            except Exception as e:
-                logger.error(f"[ARTIFACT_SELECTION] LLM selection failed: {e}, using most recent")
-                final_answer = list(candidate_artifacts.values())[-1]
-                selected_key = list(candidate_artifacts.keys())[-1]
-        elif len(candidate_artifacts) == 1:
-            # Only one candidate - use it
-            final_answer = list(candidate_artifacts.values())[0]
-            selected_key = list(candidate_artifacts.keys())[0]
-            logger.info(f"[ARTIFACT_SELECTION] Single candidate: {selected_key}")
-        else:
-            # No candidates found - check if plan specified an artifact
-            from_key = final_spec.get("from", "")
-            if from_key:
-                logger.warning(f"[ARTIFACT_SELECTION] No candidates found, trying plan-specified '{from_key}'")
-                cleaned_key = from_key.strip()
-                # Strip template markers {{}} from artifact references
-                cleaned_key = re.sub(r"^\{\{|\}\}$", "", cleaned_key).strip()
-                cleaned_key = re.sub(r"^static value\s*['\"]?|['\"]?$", "", cleaned_key)
-                cleaned_key = re.sub(r"^['\"]|['\"]$", "", cleaned_key).strip()
-                
-                # Infrastructure: Handle nested field access with dot notation
-                # Example: "chart_result.unique_categories" → artifacts["chart_result"]["unique_categories"]
-                if '.' in cleaned_key:
-                    parts = cleaned_key.split('.')
-                    base_key = parts[0]
-                    if base_key in artifacts:
-                        final_answer = artifacts[base_key]
-                        # Navigate nested fields
-                        for field in parts[1:]:
-                            if isinstance(final_answer, dict) and field in final_answer:
-                                final_answer = final_answer[field]
-                                logger.info(f"[ARTIFACT_NESTED] Extracted field '{field}' from artifact '{base_key}'")
-                            else:
-                                logger.warning(f"[ARTIFACT_NESTED] Field '{field}' not found in artifact '{base_key}'")
-                                final_answer = None
-                                break
-                        selected_key = cleaned_key if final_answer is not None else "none"
-                    else:
-                        logger.warning(f"[ARTIFACT_NESTED] Base artifact '{base_key}' not found")
-                        final_answer = cleaned_key  # Use as literal
-                        selected_key = "literal"
-                elif from_key in artifacts:
-                    final_answer = artifacts[from_key]
-                    selected_key = from_key
-                elif cleaned_key in artifacts:
-                    final_answer = artifacts[cleaned_key]
-                    selected_key = cleaned_key
-                else:
-                    logger.warning(f"[ARTIFACT_SELECTION] '{from_key}' not found, using as literal")
-                    final_answer = cleaned_key
-                    selected_key = "literal"
+            elif len(candidate_artifacts) == 1:
+                # Only one candidate - use it
+                final_answer = list(candidate_artifacts.values())[0]
+                selected_key = list(candidate_artifacts.keys())[0]
+                logger.info(f"[ARTIFACT_SELECTION] Single candidate: {selected_key}")
             else:
-                logger.error("[ARTIFACT_SELECTION] No candidates and no plan-specified artifact!")
-                final_answer = None
-                selected_key = "none"
-        
-        # Handle dict objects and string representations of dicts
-        if isinstance(final_answer, dict):
-            # Handle statistics results: {'statistics': {'column': {'sum': value}}}
-            if 'statistics' in final_answer:
-                logger.info(f"[ARTIFACT_EXTRACTION] Detected statistics result: {final_answer}")
-                stats_dict = final_answer['statistics']
-                # Extract the actual values from nested structure
-                if isinstance(stats_dict, dict):
-                    # Get first column's statistics
-                    first_col = next(iter(stats_dict.keys()))
-                    col_stats = stats_dict[first_col]
-                    if isinstance(col_stats, dict) and len(col_stats) > 0:
-                        # If only one stat, return that value
-                        if len(col_stats) == 1:
-                            stat_value = next(iter(col_stats.values()))
-                            # Handle numpy types
-                            if hasattr(stat_value, 'item'):
-                                stat_value = stat_value.item()
-                            logger.info(f"[ARTIFACT_EXTRACTION] Extracted single statistic value: {stat_value}")
-                            final_answer = stat_value
+                # No candidates found - check if plan specified an artifact
+                from_key = final_spec.get("from", "")
+                if from_key:
+                    logger.warning(f"[ARTIFACT_SELECTION] No candidates found, trying plan-specified '{from_key}'")
+                    cleaned_key = from_key.strip()
+                    # Strip template markers {{}} from artifact references
+                    cleaned_key = re.sub(r"^\{\{|\}\}$", "", cleaned_key).strip()
+                    cleaned_key = re.sub(r"^static value\s*['\"]?|['\"]?$", "", cleaned_key)
+                    cleaned_key = re.sub(r"^['\"]|['\"]$", "", cleaned_key).strip()
+                
+                    # Infrastructure: Handle nested field access with dot notation
+                    # Example: "chart_result.unique_categories" → artifacts["chart_result"]["unique_categories"]
+                    if '.' in cleaned_key:
+                        parts = cleaned_key.split('.')
+                        base_key = parts[0]
+                        if base_key in artifacts:
+                            final_answer = artifacts[base_key]
+                            # Navigate nested fields
+                            for field in parts[1:]:
+                                if isinstance(final_answer, dict) and field in final_answer:
+                                    final_answer = final_answer[field]
+                                    logger.info(f"[ARTIFACT_NESTED] Extracted field '{field}' from artifact '{base_key}'")
+                                else:
+                                    logger.warning(f"[ARTIFACT_NESTED] Field '{field}' not found in artifact '{base_key}'")
+                                    final_answer = None
+                                    break
+                            selected_key = cleaned_key if final_answer is not None else "none"
                         else:
-                            # Multiple stats - prefer sum, then mean, then first
-                            if 'sum' in col_stats:
-                                final_answer = col_stats['sum']
-                                if hasattr(final_answer, 'item'):
-                                    final_answer = final_answer.item()
-                                logger.info(f"[ARTIFACT_EXTRACTION] Extracted 'sum': {final_answer}")
-                            elif 'mean' in col_stats:
-                                final_answer = col_stats['mean']
-                                if hasattr(final_answer, 'item'):
-                                    final_answer = final_answer.item()
-                                logger.info(f"[ARTIFACT_EXTRACTION] Extracted 'mean': {final_answer}")
-                            else:
-                                final_answer = next(iter(col_stats.values()))
-            
-            # Handle extract_patterns result format: {'matches': [...], 'count': N, 'pattern_type': 'email'}
-            if isinstance(final_answer, dict) and 'pattern_type' in final_answer and 'count' in final_answer:
-                logger.info(f"[ARTIFACT_EXTRACTION] Detected extract_patterns result: {final_answer}")
-                # Check if question asks for count vs actual value
-                is_count_question = False
-                if page_text:
-                    count_keywords = ['how many', 'number of', 'count of', 'count the']
-                    is_count_question = any(keyword in page_text.lower() for keyword in count_keywords)
-                
-                if is_count_question:
-                    # Extract just the count for "how many" questions
-                    final_answer = final_answer['count']
-                    logger.info(f"[ARTIFACT_EXTRACTION] Count question detected - extracted count: {final_answer}")
-                else:
-                    # Extract the actual matched value(s)
-                    matches = final_answer['matches']
-                    if matches and len(matches) > 0:
-                        # If single match, return the value directly
-                        final_answer = matches[0] if len(matches) == 1 else matches
-                        logger.info(f"[ARTIFACT_EXTRACTION] Value question detected - extracted matches: {final_answer}")
+                            logger.warning(f"[ARTIFACT_NESTED] Base artifact '{base_key}' not found")
+                            final_answer = cleaned_key  # Use as literal
+                            selected_key = "literal"
+                    elif from_key in artifacts:
+                        final_answer = artifacts[from_key]
+                        selected_key = from_key
+                    elif cleaned_key in artifacts:
+                        final_answer = artifacts[cleaned_key]
+                        selected_key = cleaned_key
                     else:
+                        logger.warning(f"[ARTIFACT_SELECTION] '{from_key}' not found, using as literal")
+                        final_answer = cleaned_key
+                        selected_key = "literal"
+                else:
+                    logger.error("[ARTIFACT_SELECTION] No candidates and no plan-specified artifact!")
+                    final_answer = None
+                    selected_key = "none"
+        
+            # Handle dict objects and string representations of dicts
+            if isinstance(final_answer, dict):
+                # Handle dataframe metadata: {'dataframe_key': 'df_X', 'shape': (...), ...}
+                if 'dataframe_key' in final_answer:
+                    df_key = final_answer['dataframe_key']
+                    logger.info(f"[ARTIFACT_EXTRACTION] Detected dataframe metadata with key: {df_key}")
+                    if df_key in dataframe_registry:
+                        import pandas as pd
+                        df = dataframe_registry[df_key]
+                        # Convert to JSON array
+                        final_answer = df.to_json(orient='records', date_format='iso')
+                        # Parse back to get compact JSON (json already imported at top)
+                        final_answer = json.loads(final_answer)
+                        logger.info(f"[ARTIFACT_EXTRACTION] Converted dataframe to JSON array with {len(final_answer)} rows")
+                    else:
+                        logger.warning(f"[ARTIFACT_EXTRACTION] Dataframe key '{df_key}' not found in registry")
+            
+                # Handle statistics results: {'statistics': {'column': {'sum': value}}}
+                elif 'statistics' in final_answer:
+                    logger.info(f"[ARTIFACT_EXTRACTION] Detected statistics result: {final_answer}")
+                    stats_dict = final_answer['statistics']
+                    # Extract the actual values from nested structure
+                    if isinstance(stats_dict, dict):
+                        # Get first column's statistics
+                        first_col = next(iter(stats_dict.keys()))
+                        col_stats = stats_dict[first_col]
+                        if isinstance(col_stats, dict) and len(col_stats) > 0:
+                            # If only one stat, return that value
+                            if len(col_stats) == 1:
+                                stat_value = next(iter(col_stats.values()))
+                                # Handle numpy types
+                                if hasattr(stat_value, 'item'):
+                                    stat_value = stat_value.item()
+                                logger.info(f"[ARTIFACT_EXTRACTION] Extracted single statistic value: {stat_value}")
+                                final_answer = stat_value
+                            else:
+                                # Multiple stats - prefer sum, then mean, then first
+                                if 'sum' in col_stats:
+                                    final_answer = col_stats['sum']
+                                    if hasattr(final_answer, 'item'):
+                                        final_answer = final_answer.item()
+                                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted 'sum': {final_answer}")
+                                elif 'mean' in col_stats:
+                                    final_answer = col_stats['mean']
+                                    if hasattr(final_answer, 'item'):
+                                        final_answer = final_answer.item()
+                                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted 'mean': {final_answer}")
+                                else:
+                                    final_answer = next(iter(col_stats.values()))
+            
+                # Handle extract_patterns result format: {'matches': [...], 'count': N, 'pattern_type': 'email'}
+                if isinstance(final_answer, dict) and 'pattern_type' in final_answer and 'count' in final_answer:
+                    logger.info(f"[ARTIFACT_EXTRACTION] Detected extract_patterns result: {final_answer}")
+                    # Check if question asks for count vs actual value
+                    is_count_question = False
+                    if page_text:
+                        count_keywords = ['how many', 'number of', 'count of', 'count the']
+                        is_count_question = any(keyword in page_text.lower() for keyword in count_keywords)
+                
+                    if is_count_question:
+                        # Extract just the count for "how many" questions
                         final_answer = final_answer['count']
-                        logger.info(f"[ARTIFACT_EXTRACTION] No matches found - falling back to count: {final_answer}")
+                        logger.info(f"[ARTIFACT_EXTRACTION] Count question detected - extracted count: {final_answer}")
+                    else:
+                        # Extract the actual matched value(s)
+                        matches = final_answer['matches']
+                        if matches and len(matches) > 0:
+                            # If single match, return the value directly
+                            final_answer = matches[0] if len(matches) == 1 else matches
+                            logger.info(f"[ARTIFACT_EXTRACTION] Value question detected - extracted matches: {final_answer}")
+                        else:
+                            final_answer = final_answer['count']
+                            logger.info(f"[ARTIFACT_EXTRACTION] No matches found - falling back to count: {final_answer}")
             
-            # Infrastructure: Handle chart result format: {'chart_path': 'path', 'unique_categories': N}
-            # For "how many categories" questions, extract the count
-            if isinstance(final_answer, dict) and 'chart_path' in final_answer and 'unique_categories' in final_answer:
-                logger.info(f"[ARTIFACT_EXTRACTION] Detected chart result: {final_answer}")
-                # Check if question asks for category count
-                if page_text and ('how many categor' in page_text.lower() or 'number of categor' in page_text.lower()):
-                    final_answer = final_answer['unique_categories']
-                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted unique_categories for count question: {final_answer}")
+                # Infrastructure: Handle chart result format: {'chart_path': 'path', 'unique_categories': N}
+                # For "how many categories" questions, extract the count
+                if isinstance(final_answer, dict) and 'chart_path' in final_answer and 'unique_categories' in final_answer:
+                    logger.info(f"[ARTIFACT_EXTRACTION] Detected chart result: {final_answer}")
+                    # Check if question asks for category count
+                    if page_text and ('how many categor' in page_text.lower() or 'number of categor' in page_text.lower()):
+                        final_answer = final_answer['unique_categories']
+                        logger.info(f"[ARTIFACT_EXTRACTION] Extracted unique_categories for count question: {final_answer}")
             
-            # Handle train_linear_regression result format: {'prediction': value, 'coefficients': [...], ...}
-            if isinstance(final_answer, dict) and 'prediction' in final_answer and 'model_type' in final_answer:
-                logger.info(f"[ARTIFACT_EXTRACTION] Detected train_linear_regression result: {final_answer}")
-                # Extract just the prediction value
-                final_answer = final_answer['prediction']
-                logger.info(f"[ARTIFACT_EXTRACTION] Extracted prediction: {final_answer}")
+                # Handle train_linear_regression result format: {'prediction': value, 'coefficients': [...], ...}
+                if isinstance(final_answer, dict) and 'prediction' in final_answer and 'model_type' in final_answer:
+                    logger.info(f"[ARTIFACT_EXTRACTION] Detected train_linear_regression result: {final_answer}")
+                    # Extract just the prediction value
+                    final_answer = final_answer['prediction']
+                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted prediction: {final_answer}")
             
-            # Handle vision/OCR result format: {'result': 'text'}
-            if isinstance(final_answer, dict) and 'result' in final_answer and len(final_answer) == 1:
-                logger.info(f"[ARTIFACT_EXTRACTION] Detected vision/OCR result: {final_answer}")
-                final_answer = final_answer['result']
-                logger.info(f"[ARTIFACT_EXTRACTION] Extracted vision result: {final_answer}")
+                # Handle vision/OCR result format: {'result': 'text'}
+                if isinstance(final_answer, dict) and 'result' in final_answer and len(final_answer) == 1:
+                    logger.info(f"[ARTIFACT_EXTRACTION] Detected vision/OCR result: {final_answer}")
+                    final_answer = final_answer['result']
+                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted vision result: {final_answer}")
             
-            # Handle dataframe_ops result format: {'result': value, 'type': 'typename'}
-            elif isinstance(final_answer, dict) and 'result' in final_answer and 'type' in final_answer:
-                result_value = final_answer['result']
-                # Handle numpy types
-                if hasattr(result_value, 'item'):
-                    result_value = result_value.item()
-                logger.info(f"[ARTIFACT_EXTRACTION] Extracted result value: {result_value}")
-                final_answer = result_value
-            # Actual dict object with 'text' key
-            elif isinstance(final_answer, dict) and 'text' in final_answer:
-                logger.info(f"[ARTIFACT_EXTRACTION] Extracting 'text' from dict object")
-                final_answer = final_answer['text']
-                logger.info(f"[ARTIFACT_EXTRACTION] Extracted: {str(final_answer)[:100]}...")
+                # Handle dataframe_ops result format: {'result': value, 'type': 'typename'}
+                elif isinstance(final_answer, dict) and 'result' in final_answer and 'type' in final_answer:
+                    result_value = final_answer['result']
+                    # Handle numpy types
+                    if hasattr(result_value, 'item'):
+                        result_value = result_value.item()
+                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted result value: {result_value}")
+                    final_answer = result_value
+                # Actual dict object with 'text' key
+                elif isinstance(final_answer, dict) and 'text' in final_answer:
+                    logger.info(f"[ARTIFACT_EXTRACTION] Extracting 'text' from dict object")
+                    final_answer = final_answer['text']
+                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted: {str(final_answer)[:100]}...")
         
-        elif isinstance(final_answer, str) and (final_answer.startswith("{'") or final_answer.startswith('{"')):
-            # String representation of a dict - try to extract 'text'
-            logger.info(f"[ARTIFACT_EXTRACTION] Detected string dict representation, extracting 'text'...")
-            try:
-                import ast
-                dict_obj = ast.literal_eval(final_answer)
-                if isinstance(dict_obj, dict) and 'text' in dict_obj:
-                    final_answer = dict_obj['text']
-                    logger.info(f"[ARTIFACT_EXTRACTION] Extracted text from dict string: {str(final_answer)[:100]}...")
-            except (ValueError, SyntaxError):
-                logger.info(f"[ARTIFACT_EXTRACTION] Could not parse dict string, using as-is")
-        
-        if not final_answer and len(all_tasks) == 0:
-            logger.info("Plan has no tasks and no artifact reference, providing default answer")
-            answer_type = final_spec.get("type", "string")
-            if answer_type == "boolean":
-                final_answer = "true"
-            elif answer_type == "number":
-                final_answer = "0"
-            elif answer_type == "json":
-                final_answer = "{}"
-            else:
-                final_answer = "completed"
+            elif isinstance(final_answer, str) and (final_answer.startswith("{'") or final_answer.startswith('{"')):
+                # String representation of a dict - try to extract 'text'
+                logger.info(f"[ARTIFACT_EXTRACTION] Detected string dict representation, extracting 'text'...")
+                try:
+                    import ast
+                    dict_obj = ast.literal_eval(final_answer)
+                    if isinstance(dict_obj, dict) and 'text' in dict_obj:
+                        final_answer = dict_obj['text']
+                        logger.info(f"[ARTIFACT_EXTRACTION] Extracted text from dict string: {str(final_answer)[:100]}...")
+                except (ValueError, SyntaxError):
+                    logger.info(f"[ARTIFACT_EXTRACTION] Could not parse dict string, using as-is")
+            
+                if not final_answer and len(all_tasks) == 0:
+                    logger.info("Plan has no tasks and no artifact reference, providing default answer")
+                    answer_type = final_spec.get("type", "string")
+                    if answer_type == "boolean":
+                        final_answer = "true"
+                    elif answer_type == "number":
+                        final_answer = "0"
+                    elif answer_type == "json":
+                        final_answer = "{}"
+                    else:
+                        final_answer = "completed"
         
         # Submit answer
+        logger.info(f"\n[ANSWER_READY] ===== ANSWER READY FOR SUBMISSION =====")
+        logger.info(f"[ANSWER_READY] Quiz URL: {origin_url}")
+        logger.info(f"[ANSWER_READY] Answer type: {type(final_answer).__name__}")
+        logger.info(f"[ANSWER_READY] Answer value: {json.dumps(final_answer, indent=2, default=str) if not isinstance(final_answer, str) else final_answer}")
+        logger.info(f"[ANSWER_READY] ===== ANSWER READY COMPLETE =====\n")
+        
         logger.info(f"Final answer ready for submission: {final_answer}")
         
         # Convert numpy types to native Python types for JSON serialization
@@ -958,11 +1031,21 @@ Which artifact key contains the actual answer to the question? Respond with ONLY
         }
 
 
-async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
+async def run_pipeline(email: str, url: str, manual_override_queue: list = None) -> Dict[str, Any]:
     """
     Run the complete quiz-solving pipeline for a single URL
     Handles multiple sequential quizzes and retry logic
+    
+    Args:
+        email: User email
+        url: Quiz URL
+        manual_override_queue: Optional list of manual answers to try on current quiz
+                              Each entry: {"answer": answer, "timestamp": time}
+                              Answers are tried in order, removed if incorrect
     """
+    if manual_override_queue is None:
+        manual_override_queue = []
+    
     try:
         quiz_runs = {}
         quiz_chain = []
@@ -973,101 +1056,184 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
             logger.info(f"SOLVING QUIZ: {current_url}")
             logger.info(f"{'='*60}\n")
             
-            # Initialize QuizRun for this URL
-            if current_url not in quiz_runs:
-                quiz_runs[current_url] = QuizRun(quiz_url=current_url)
+            # Clear page_data for new quiz (prevents reusing cached data from previous quiz)
+            page_data = None
             
-            quiz_run = quiz_runs[current_url]
+            # Initialize QuizRun for this URL
+            try:
+                if current_url not in quiz_runs:
+                    quiz_runs[current_url] = QuizRun(quiz_url=current_url)
+                
+                quiz_run = quiz_runs[current_url]
+            except Exception as e:
+                logger.error(f"[QUIZ_INIT] CRITICAL: Failed to initialize quiz run: {e}")
+                logger.warning(f"[QUIZ_INIT] Skipping quiz {current_url}")
+                quiz_chain.append({
+                    "quiz_url": current_url,
+                    "failed": True,
+                    "error": f"Failed to initialize: {e}"
+                })
+                break  # Exit outer loop
             
             # Retry loop for incorrect answers
             while True:
                 # Check timeout BEFORE starting new attempt
-                if quiz_run.attempts:  # Skip check on first attempt
-                    elapsed_time = quiz_run.elapsed_time_since_first()
-                    max_retry_time = 180  # 3 minutes in seconds
-                    
-                    if elapsed_time >= max_retry_time:
-                        logger.warning(f"[QUIZ_TIMEOUT] Quiz exceeded {max_retry_time}s timeout before attempt. Elapsed: {elapsed_time:.1f}s")
+                try:
+                    if quiz_run.attempts:  # Skip check on first attempt
+                        elapsed_time = quiz_run.elapsed_time_since_first()
+                        max_retry_time = 180  # 3 minutes in seconds
                         
-                        # Need to submit a dummy answer to get next URL
-                        logger.info(f"[QUIZ_TIMEOUT] Submitting timeout answer to get next URL")
-                        submit_url = page_data.get("submit_url", "") if 'page_data' in locals() else ""
-                        
-                        if submit_url:
-                            timeout_body = {
-                                "email": email,
-                                "secret": get_secret(),
-                                "url": current_url,
-                                "answer": "TIMEOUT_SKIP"
-                            }
-                            try:
-                                timeout_response = await answer_submit(submit_url, timeout_body)
-                                timeout_data = timeout_response.get("response", {})
-                                
-                                if "url" in timeout_data and timeout_data["url"]:
-                                    next_url = timeout_data["url"]
-                                    logger.info(f"[QUIZ_TIMEOUT_SKIP] Got next quiz URL: {next_url}")
+                        if elapsed_time >= max_retry_time:
+                            logger.warning(f"[QUIZ_TIMEOUT] Quiz exceeded {max_retry_time}s timeout before attempt. Elapsed: {elapsed_time:.1f}s")
+                            
+                            # Need to submit a dummy answer to get next URL
+                            logger.info(f"[QUIZ_TIMEOUT] Submitting timeout answer to get next URL")
+                            submit_url = page_data.get("submit_url", "") if 'page_data' in locals() else ""
+                            
+                            if submit_url:
+                                timeout_body = {
+                                    "email": email,
+                                    "secret": get_secret(),
+                                    "url": current_url,
+                                    "answer": "TIMEOUT_SKIP"
+                                }
+                                try:
+                                    timeout_response = await answer_submit(submit_url, timeout_body)
+                                    timeout_data = timeout_response.get("response", {})
                                     
-                                    quiz_chain.append({
-                                        "quiz_url": current_url,
-                                        "quiz_run": quiz_run.to_dict(),
-                                        "timeout": True,
-                                        "reason": f"Exceeded {max_retry_time}s timeout before attempt"
-                                    })
-                                    
-                                    current_url = next_url
-                                    break  # Break to outer loop for next quiz
-                                else:
-                                    logger.error(f"[QUIZ_TIMEOUT_FAIL] No next URL in timeout response")
+                                    if "url" in timeout_data and timeout_data["url"]:
+                                        next_url = timeout_data["url"]
+                                        logger.info(f"[QUIZ_TIMEOUT_SKIP] Got next quiz URL: {next_url}")
+                                        
+                                        quiz_chain.append({
+                                            "quiz_url": current_url,
+                                            "quiz_run": quiz_run.to_dict(),
+                                            "timeout": True,
+                                            "reason": f"Exceeded {max_retry_time}s timeout before attempt"
+                                        })
+                                        
+                                        current_url = next_url
+                                        break  # Break to outer loop for next quiz
+                                    else:
+                                        logger.error(f"[QUIZ_TIMEOUT_FAIL] No next URL in timeout response")
+                                        quiz_chain.append({
+                                            "quiz_url": current_url,
+                                            "quiz_run": quiz_run.to_dict(),
+                                            "timeout": True,
+                                            "failed": True,
+                                            "reason": f"Exceeded {max_retry_time}s timeout, no next quiz available"
+                                        })
+                                        break
+                                except Exception as e:
+                                    logger.error(f"[QUIZ_TIMEOUT] Failed to submit timeout answer: {e}")
                                     quiz_chain.append({
                                         "quiz_url": current_url,
                                         "quiz_run": quiz_run.to_dict(),
                                         "timeout": True,
                                         "failed": True,
-                                        "reason": f"Exceeded {max_retry_time}s timeout, no next quiz available"
+                                        "reason": f"Timeout submission failed: {e}"
                                     })
                                     break
-                            except Exception as e:
-                                logger.error(f"[QUIZ_TIMEOUT] Failed to submit timeout answer: {e}")
+                            else:
+                                logger.error(f"[QUIZ_TIMEOUT] No submit URL available")
                                 quiz_chain.append({
                                     "quiz_url": current_url,
                                     "quiz_run": quiz_run.to_dict(),
                                     "timeout": True,
                                     "failed": True,
-                                    "reason": f"Timeout submission failed: {e}"
+                                    "reason": "Timeout, no submit URL"
                                 })
                                 break
-                        else:
-                            logger.error(f"[QUIZ_TIMEOUT] No submit URL available")
-                            break
+                except Exception as e:
+                    logger.error(f"[QUIZ_TIMEOUT_CHECK] CRITICAL: Timeout check failed: {e}")
+                    logger.warning(f"[QUIZ_TIMEOUT_CHECK] Continuing with attempt anyway")
+                    # Continue with attempt
                 
-                # Create new attempt
-                quiz_attempt = quiz_run.start_attempt()
-                logger.info(f"[QUIZ_RUN] Starting attempt {quiz_attempt.attempt_number} for {current_url}")
+                # CREATE NEW ATTEMPT - wrapped in try-catch to prevent crashes
+                try:
+                    quiz_attempt = quiz_run.start_attempt()
+                    logger.info(f"[QUIZ_RUN] Starting attempt {quiz_attempt.attempt_number} for {current_url}")
+                except Exception as e:
+                    logger.error(f"[QUIZ_RUN] CRITICAL: Failed to create attempt: {e}")
+                    # Create emergency attempt object
+                    class EmergencyAttempt:
+                        def __init__(self):
+                            self.attempt_number = 1
+                            self.final_answer = None
+                            self.success = False
+                        def finish(self): pass
+                        def mark_complete(self): pass
+                    quiz_attempt = EmergencyAttempt()
                 
-                # Render page
-                logger.info(f"[QUIZ_RUN] Rendering quiz page")
-                page_data = await render_page(current_url)
-                logger.info(f"[QUIZ_RUN] Page rendered - text length: {len(page_data.get('text', ''))}")
+                # CHECK FOR MANUAL OVERRIDE - inject as high-priority artifact
+                manual_override_used = False
+                if len(manual_override_queue) > 0:
+                    override_entry = manual_override_queue[0]
+                    override_answer = override_entry["answer"]
+                    
+                    logger.warning(f"[MANUAL_OVERRIDE] ===== MANUAL OVERRIDE DETECTED START =====")
+                    logger.warning(f"[MANUAL_OVERRIDE] Quiz URL: {current_url}")
+                    logger.warning(f"[MANUAL_OVERRIDE] Manual Answer: {override_answer}")
+                    logger.warning(f"[MANUAL_OVERRIDE] Answer Type: {type(override_answer).__name__}")
+                    logger.warning(f"[MANUAL_OVERRIDE] Queue Position: 1/{len(manual_override_queue)}")
+                    logger.warning(f"[MANUAL_OVERRIDE] Will inject as highest-priority answer candidate")
+                    logger.warning(f"[MANUAL_OVERRIDE] ===== MANUAL OVERRIDE DETECTED END =====")
+                    manual_override_used = True
+                
+                # Render page (unless already rendered for manual override)
+                if page_data is None:
+                    try:
+                        page_data = await render_page(current_url)
+                        logger.info(f"[PAGE] {page_data.get('text', 'NO TEXT')}")
+                    except Exception as e:
+                        logger.error(f"[QUIZ_RUN] CRITICAL: Failed to render page: {e}")
+                        logger.error(f"[QUIZ_RUN] Attempting to continue with minimal page data")
+                        page_data = {
+                            "text": "ERROR: Failed to render page",
+                            "html": "",
+                            "links": [],
+                            "submit_url": f"{current_url}/submit",
+                            "origin_url": current_url
+                        }
+                else:
+                    logger.info(f"[QUIZ_RUN] Page rendered - text length: {len(page_data.get('text', ''))}")
                 
                 # Generate execution plan
-                logger.info(f"[QUIZ_RUN] Generating execution plan")
-                plan_response = await call_llm_for_plan(page_data, quiz_run.attempts[:-1] if len(quiz_run.attempts) > 1 else None)
-                plan_json = extract_json_from_markdown(plan_response)
-                
                 try:
-                    plan_obj = json.loads(plan_json)
-                    logger.info(f"[QUIZ_RUN] Plan parsed successfully")
-                except json.JSONDecodeError as e:
-                    logger.error(f"[QUIZ_RUN] Failed to parse plan JSON: {e}")
-                    logger.error(f"[QUIZ_RUN] Raw plan response: {plan_response}")
-                    quiz_attempt.error = f"Failed to parse plan: {e}"
-                    quiz_attempt.finish()
-                    quiz_run.finish_current_attempt()
-                    return {
-                        "success": False,
-                        "error": f"Failed to parse execution plan: {e}",
-                        "quiz_runs": {url: qr.to_dict() for url, qr in quiz_runs.items()}
+                    logger.info(f"[QUIZ_RUN] Generating execution plan")
+                    plan_response = await call_llm_for_plan(page_data, quiz_run.attempts[:-1] if len(quiz_run.attempts) > 1 else None)
+                    logger.info(f"[PLAN_RESPONSE] ===== FULL LLM PLAN RESPONSE START =====")
+                    logger.info(f"[PLAN_RESPONSE] {plan_response}")
+                    logger.info(f"[PLAN_RESPONSE] ===== FULL LLM PLAN RESPONSE END =====")
+                    
+                    plan_json = extract_json_from_markdown(plan_response)
+                    logger.info(f"[PLAN_JSON] ===== EXTRACTED JSON START =====")
+                    logger.info(f"[PLAN_JSON] {plan_json}")
+                    logger.info(f"[PLAN_JSON] ===== EXTRACTED JSON END =====")
+                    
+                    try:
+                        plan_obj = json.loads(plan_json)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"[QUIZ_RUN] Failed to parse plan JSON: {e}")
+                        logger.error(f"[QUIZ_RUN] Raw plan response: {plan_response[:500]}...")
+                        logger.warning(f"[QUIZ_RUN] Creating fallback plan to submit empty answer")
+                        # Create minimal fallback plan
+                        plan_obj = {
+                            "submit_url": page_data.get("submit_url", f"{current_url}/submit"),
+                            "origin_url": current_url,
+                            "tasks": [],
+                            "final_answer_spec": {"type": "string", "from": "ERROR: Could not parse plan"},
+                            "request_body": {"email_key": "email", "secret_key": "secret", "url_value": "url", "answer_key": "answer"}
+                        }
+                except Exception as e:
+                    logger.error(f"[QUIZ_RUN] CRITICAL: Failed to generate plan: {e}")
+                    logger.warning(f"[QUIZ_RUN] Creating emergency fallback plan")
+                    plan_obj = {
+                        "submit_url": page_data.get("submit_url", f"{current_url}/submit"),
+                        "origin_url": current_url,
+                        "tasks": [],
+                        "final_answer_spec": {"type": "string", "from": "ERROR: Plan generation failed"},
+                        "request_body": {"email_key": "email", "secret_key": "secret", "url_value": "url", "answer_key": "answer"}
                     }
                 
                 # Add previous attempts context if this is a retry
@@ -1080,159 +1246,294 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
                         previous_attempts_context += f"  - Result: {'Correct' if prev_attempt.correct else 'Incorrect'}\n"
                         if prev_attempt.error:
                             previous_attempts_context += f"  - Error: {prev_attempt.error}\n"
-                    logger.info(f"[QUIZ_RUN] Context from {len(quiz_run.attempts)-1} previous attempts prepared")
-                
-                # Execute plan with attempt tracking
-                logger.info(f"[QUIZ_RUN] Executing plan for attempt {quiz_attempt.attempt_number}")
-                execution_result = await execute_plan(plan_obj, email, current_url, page_data, quiz_attempt)
-                logger.info(f"[QUIZ_EXECUTION] Execution result: success={execution_result.get('success')}, final_answer={execution_result.get('final_answer')}")
+                # Inject manual override answer
+                if manual_override_used:
+                    override_answer = manual_override_queue[0]["answer"]
+                    plan_obj["final_answer_spec"] = {
+                        "type": "manual_override",
+                        "value": override_answer,
+                        "fallback": plan_obj.get("final_answer_spec", {"type": "string", "from": "ERROR: No answer found"})
+                    }                # Execute plan
+                try:
+                    execution_result = await execute_plan(plan_obj, email, current_url, page_data, quiz_attempt)
+                except Exception as e:
+                    logger.error(f"[QUIZ_EXECUTION] CRITICAL: Plan execution crashed: {e}")
+                    logger.error(f"[QUIZ_EXECUTION] Traceback:", exc_info=True)
+                    logger.warning(f"[QUIZ_EXECUTION] Creating fallback execution result")
+                    execution_result = {
+                        "success": True,  # Mark as "success" to continue
+                        "final_answer": f"ERROR: Execution crashed - {str(e)[:100]}",
+                        "submission_result": None,
+                        "error": str(e)
+                    }
                 
                 quiz_attempt.finish()
                 
+                # Don't return early on execution failure - try to submit something
                 if not execution_result.get("success"):
                     logger.error(f"[QUIZ_RUN] Execution failed at attempt {quiz_attempt.attempt_number}")
-                    quiz_run.finish_current_attempt()
-                    return {
-                        "success": False,
-                        "error": execution_result.get("error", "Unknown error"),
-                        "quiz_runs": {url: qr.to_dict() for url, qr in quiz_runs.items()}
-                    }
+                    logger.warning(f"[QUIZ_RUN] Will attempt to submit error placeholder and continue")
+                    # Don't return - let it try to submit
                 
                 # Check submission response
                 submission_response = execution_result.get("submission_result", {})
                 response_data = submission_response.get("response", {}) if submission_response else {}
                 
-                logger.info(f"[QUIZ_RESPONSE] Submission response: {submission_response}")
-                logger.info(f"[QUIZ_RESPONSE] Full response data: {json.dumps(response_data, indent=2)}")
+                # If no submission happened (execution failed), try emergency submission
+                if not submission_response:
+                    logger.warning(f"[QUIZ_SUBMISSION] No submission result - attempting emergency submission")
+                    try:
+                        submit_url = plan_obj.get("submit_url", f"{current_url}/submit")
+                        emergency_answer = execution_result.get("final_answer", "ERROR")
+                        submit_body = {
+                            "email": email,
+                            "secret": get_secret(),
+                            "url": current_url,
+                            "answer": emergency_answer
+                        }
+                        emergency_response = await answer_submit(submit_url, submit_body)
+                        response_data = emergency_response.get("response", {})
+                        logger.info(f"[QUIZ_SUBMISSION] Emergency submission completed: {response_data}")
+                    except Exception as e:
+                        logger.error(f"[QUIZ_SUBMISSION] Emergency submission also failed: {e}")
+                        # Create fake response to continue
+                        response_data = {"correct": False, "message": f"Submission failed: {e}"}
                 
                 # Check if answer was correct
-                is_correct = response_data.get("correct", False)
-                logger.info(f"[QUIZ_RESPONSE] Answer correct: {is_correct}")
+                try:
+                    is_correct = response_data.get("correct", False)
+                    if is_correct:
+                        logger.info(f"[SUCCESS] ✓✓✓ CORRECT ANSWER ✓✓✓ Quiz: {current_url}, Answer: {execution_result.get('final_answer')}")
+                    else:
+                        logger.warning(f"[FAILURE] ✗✗✗ INCORRECT ANSWER ✗✗✗ Quiz: {current_url}, Answer: {execution_result.get('final_answer')}")
+                        logger.warning(f"[FAILURE] Server message: {response_data.get('message', 'No message')}")
+                    
+                    # Store attempt results
+                    quiz_attempt.submission_response = response_data
+                    quiz_attempt.correct = is_correct
+                    quiz_run.finish_current_attempt()
+                except Exception as e:
+                    logger.error(f"[QUIZ_RESPONSE] CRITICAL: Failed to process response: {e}")
+                    logger.warning(f"[QUIZ_RESPONSE] Marking as incorrect and continuing")
+                    is_correct = False
+                    quiz_attempt.submission_response = {"error": str(e)}
+                    quiz_attempt.correct = False
+                    quiz_run.finish_current_attempt()
                 
-                # Store attempt results
-                quiz_attempt.submission_response = response_data
-                quiz_attempt.correct = is_correct
-                quiz_run.finish_current_attempt()
+                # Handle manual override queue cleanup
+                if manual_override_used and len(manual_override_queue) > 0:
+                    removed_answer = manual_override_queue.pop(0)
+                    if is_correct:
+                        logger.info(f"[MANUAL_OVERRIDE] ✓ Correct: {removed_answer['answer']} (queue: {len(manual_override_queue)})")
+                    else:
+                        logger.warning(f"[MANUAL_OVERRIDE] ✗ Incorrect: {removed_answer['answer']} (queue: {len(manual_override_queue)})")
                 
                 if is_correct:
-                    logger.info(f"[QUIZ_SUCCESS] Quiz solved successfully on attempt {quiz_attempt.attempt_number}")
-                    
                     # Check if there's a next quiz URL
-                    if "url" in response_data and response_data["url"]:
-                        next_url = response_data["url"]
-                        logger.info(f"[QUIZ_CHAIN] Next quiz found at: {next_url}")
-                        
-                        # Add successful run to chain
-                        quiz_chain.append({
-                            "quiz_url": current_url,
-                            "quiz_run": quiz_run.to_dict()
-                        })
-                        
-                        # Move to next quiz (attempt counter will reset with new QuizRun)
-                        current_url = next_url
-                        break  # Break inner retry loop to start new quiz
-                    else:
-                        logger.info("[QUIZ_COMPLETE] No next quiz URL. Quiz chain complete!")
-                        quiz_chain.append({
-                            "quiz_url": current_url,
-                            "quiz_run": quiz_run.to_dict()
-                        })
-                        
-                        # Log cache statistics
-                        quiz_cache.log_stats()
-                        
-                        # Log completion check statistics
-                        log_completion_stats()
-                        break
-                else:
-                    # Answer was incorrect, check if we can retry
-                    elapsed_time = quiz_run.elapsed_time_since_first()
-                    avg_time = quiz_run.average_time_per_attempt()
-                    max_retry_time = 180  # 3 minutes in seconds
-                    remaining_time = max_retry_time - elapsed_time
-                    
-                    logger.info(f"[QUIZ_RETRY] Answer was incorrect. Elapsed: {elapsed_time:.1f}s, Avg per attempt: {avg_time:.1f}s, Remaining: {remaining_time:.1f}s, Attempts: {quiz_attempt.attempt_number}")
-                    
-                    # Smart retry: check if average time per attempt < remaining time
-                    if quiz_run.can_retry_smart(max_retry_time):
-                        logger.info(f"[QUIZ_RETRY] Smart retry enabled - avg time ({avg_time:.1f}s) < remaining time ({remaining_time:.1f}s). Attempting again...")
-                        # Loop continues to next attempt (timeout check at loop start will catch hard limit)
-                        continue
-                    else:
-                        # Not enough time for retry - use response_data next URL if available
-                        logger.warning(f"[QUIZ_RETRY_SKIP] Not enough time for retry. Avg time: {avg_time:.1f}s >= Remaining: {remaining_time:.1f}s after {quiz_attempt.attempt_number} attempts.")
-                        
-                        # Check if there's a next quiz URL in the response
+                    try:
                         if "url" in response_data and response_data["url"]:
                             next_url = response_data["url"]
-                            logger.info(f"[QUIZ_RETRY_SKIP] Skipping to next quiz: {next_url}")
                             
+                            # Check if next URL is the same as current URL (indicates completion)
+                            if next_url == current_url:
+                                logger.info(f"[QUIZ_COMPLETE] Next URL same as current URL - treating as chain completion")
+                                quiz_chain.append({
+                                    "quiz_url": current_url,
+                                    "quiz_run": quiz_run.to_dict()
+                                })
+                                
+                                # Log cache statistics
+                                try:
+                                    quiz_cache.log_stats()
+                                    log_completion_stats()
+                                except:
+                                    pass
+                                break
+                            
+                            logger.info(f"[QUIZ_CHAIN] Next quiz found at: {next_url}")
+                            
+                            # Add successful run to chain
                             quiz_chain.append({
                                 "quiz_url": current_url,
-                                "quiz_run": quiz_run.to_dict(),
-                                "skipped": True,
-                                "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
+                                "quiz_run": quiz_run.to_dict()
                             })
                             
-                            # Move to next quiz
+                            # Move to next quiz (attempt counter will reset with new QuizRun)
                             current_url = next_url
                             break  # Break inner retry loop to start new quiz
                         else:
-                            logger.error(f"[QUIZ_FAILED] No next quiz URL available. Stopping.")
+                            logger.info("[QUIZ_COMPLETE] No next quiz URL. Quiz chain complete!")
                             quiz_chain.append({
                                 "quiz_url": current_url,
-                                "quiz_run": quiz_run.to_dict(),
-                                "failed": True,
-                                "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
+                                "quiz_run": quiz_run.to_dict()
                             })
-                            break  # Exit to outer loop which will stop
+                            
+                            # Log cache statistics
+                            quiz_cache.log_stats()
+                            
+                            # Log completion check statistics
+                            log_completion_stats()
+                            break
+                    except Exception as e:
+                        logger.error(f"[QUIZ_CHAIN] CRITICAL: Failed to process next URL: {e}")
+                        logger.info("[QUIZ_COMPLETE] Treating as end of chain")
+                        quiz_chain.append({
+                            "quiz_url": current_url,
+                            "quiz_run": quiz_run.to_dict(),
+                            "error": f"Failed to process next URL: {e}"
+                        })
+                        
+                        # Log cache statistics
+                        try:
+                            quiz_cache.log_stats()
+                            log_completion_stats()
+                        except:
+                            pass
+                        break
+                else:
+                    # Answer was incorrect, check if we can retry
+                    try:
+                        elapsed_time = quiz_run.elapsed_time_since_first()
+                        avg_time = quiz_run.average_time_per_attempt()
+                        max_retry_time = 180  # 3 minutes in seconds
+                        remaining_time = max_retry_time - elapsed_time
+                        
+                        logger.info(f"[QUIZ_RETRY] Answer was incorrect. Elapsed: {elapsed_time:.1f}s, Avg per attempt: {avg_time:.1f}s, Remaining: {remaining_time:.1f}s, Attempts: {quiz_attempt.attempt_number}")
+                        
+                        # Smart retry: check if average time per attempt < remaining time
+                        if quiz_run.can_retry_smart(max_retry_time):
+                            logger.info(f"[QUIZ_RETRY] Smart retry enabled - avg time ({avg_time:.1f}s) < remaining time ({remaining_time:.1f}s). Attempting again...")
+                            # Loop continues to next attempt (timeout check at loop start will catch hard limit)
+                            continue
+                        else:
+                            # Not enough time for retry - use response_data next URL if available
+                            logger.warning(f"[QUIZ_RETRY_SKIP] Not enough time for retry. Avg time: {avg_time:.1f}s >= Remaining: {remaining_time:.1f}s after {quiz_attempt.attempt_number} attempts.")
+                            
+                            # Check if there's a next quiz URL in the response
+                            if "url" in response_data and response_data["url"]:
+                                next_url = response_data["url"]
+                                logger.info(f"[QUIZ_RETRY_SKIP] Skipping to next quiz: {next_url}")
+                                
+                                quiz_chain.append({
+                                    "quiz_url": current_url,
+                                    "quiz_run": quiz_run.to_dict(),
+                                    "skipped": True,
+                                    "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
+                                })
+                                
+                                # Move to next quiz
+                                current_url = next_url
+                                break  # Break inner retry loop to start new quiz
+                            else:
+                                logger.error(f"[QUIZ_FAILED] No next quiz URL available. Stopping.")
+                                quiz_chain.append({
+                                    "quiz_url": current_url,
+                                    "quiz_run": quiz_run.to_dict(),
+                                    "failed": True,
+                                    "reason": f"Not enough time for retry (avg: {avg_time:.1f}s, remaining: {remaining_time:.1f}s)"
+                                })
+                                break  # Exit to outer loop which will stop
+                    except Exception as e:
+                        logger.error(f"[QUIZ_RETRY] CRITICAL: Failed to process retry logic: {e}")
+                        logger.warning(f"[QUIZ_RETRY] Attempting to skip to next quiz if available")
+                        
+                        try:
+                            if "url" in response_data and response_data["url"]:
+                                next_url = response_data["url"]
+                                logger.info(f"[QUIZ_RETRY] Emergency skip to: {next_url}")
+                                quiz_chain.append({
+                                    "quiz_url": current_url,
+                                    "quiz_run": quiz_run.to_dict(),
+                                    "error": f"Retry logic failed: {e}"
+                                })
+                                current_url = next_url
+                                break
+                        except:
+                            pass
+                        
+                        # If no next URL, stop
+                        logger.error(f"[QUIZ_FAILED] Stopping due to retry logic failure")
+                        quiz_chain.append({
+                            "quiz_url": current_url,
+                            "quiz_run": quiz_run.to_dict(),
+                            "failed": True,
+                            "error": f"Retry logic failed: {e}"
+                        })
+                        break
             
             # Check if we should continue to next quiz
             # Continue if: success with next URL, or timeout/skip with next URL
-            last_chain_entry = quiz_chain[-1] if quiz_chain else {}
-            has_next_url = False
-            
-            if is_correct and "url" in response_data and response_data["url"]:
-                # Success case with next quiz
-                has_next_url = True
-            elif last_chain_entry.get("timeout") or last_chain_entry.get("skipped"):
-                # Timeout/skip case - check if we already set next URL
-                has_next_url = (current_url != url and current_url != last_chain_entry.get("quiz_url"))
-            
-            if has_next_url:
-                # Continue outer loop with new URL (already set above)
-                continue
-            else:
-                # No next quiz or quiz failed - exit pipeline
+            try:
+                last_chain_entry = quiz_chain[-1] if quiz_chain else {}
+                has_next_url = False
+                
+                if is_correct and "url" in response_data and response_data["url"]:
+                    # Success case - check if current_url was updated (meaning we have a new quiz)
+                    # current_url was updated in the inner loop if next_url != old current_url
+                    last_quiz_url = last_chain_entry.get("quiz_url") if last_chain_entry else url
+                    if current_url != last_quiz_url:
+                        # We moved to a new quiz
+                        has_next_url = True
+                    else:
+                        logger.info(f"[QUIZ_CONTINUATION] No new quiz URL - stopping chain")
+                        has_next_url = False
+                elif last_chain_entry.get("timeout") or last_chain_entry.get("skipped"):
+                    # Timeout/skip case - check if we already set next URL
+                    has_next_url = (current_url != url and current_url != last_chain_entry.get("quiz_url"))
+                
+                if has_next_url:
+                    # Continue outer loop with new URL (already set above)
+                    continue
+                else:
+                    # No next quiz or quiz failed - exit pipeline
+                    break
+            except Exception as e:
+                logger.error(f"[QUIZ_CONTINUATION] CRITICAL: Failed to determine if chain should continue: {e}")
+                logger.info(f"[QUIZ_CONTINUATION] Treating as end of chain")
                 break
         
         logger.info(f"[PIPELINE_COMPLETE] Quiz chain complete. Solved {len(quiz_chain)} quizzes")
         
         # Calculate summary statistics
-        total_time = sum(qr.elapsed_time_since_first() for qr in quiz_runs.values())
-        successful_quizzes = [qc for qc in quiz_chain if not qc.get("failed") and not qc.get("timeout") and not qc.get("skipped")]
-        timeout_quizzes = [qc for qc in quiz_chain if qc.get("timeout")]
-        skipped_quizzes = [qc for qc in quiz_chain if qc.get("skipped")]
-        failed_quizzes = [qc for qc in quiz_chain if qc.get("failed")]
-        
-        # Print clean summary
-        print("\n" + "="*60)
-        print("QUIZ SOLVER SUMMARY")
-        print("="*60)
-        print(f"Total Quizzes Attempted: {len(quiz_chain)}")
-        print(f"Successful: {len(successful_quizzes)}")
-        print(f"Timeout (skipped to next): {len(timeout_quizzes)}")
-        print(f"Skipped (insufficient time): {len(skipped_quizzes)}")
-        print(f"Failed: {len(failed_quizzes)}")
-        print(f"Total Execution Time: {total_time:.2f}s")
-        print(f"Average Time per Quiz: {total_time/len(quiz_chain):.2f}s")
-        print("="*60 + "\n")
+        try:
+            total_time = sum(qr.elapsed_time_since_first() for qr in quiz_runs.values())
+            successful_quizzes = [qc for qc in quiz_chain if not qc.get("failed") and not qc.get("timeout") and not qc.get("skipped")]
+            timeout_quizzes = [qc for qc in quiz_chain if qc.get("timeout")]
+            skipped_quizzes = [qc for qc in quiz_chain if qc.get("skipped")]
+            failed_quizzes = [qc for qc in quiz_chain if qc.get("failed")]
+            
+            # Print clean summary
+            print("\n" + "="*60)
+            print("QUIZ SOLVER SUMMARY")
+            print("="*60)
+            print(f"Total Quizzes Attempted: {len(quiz_chain)}")
+            print(f"Successful: {len(successful_quizzes)}")
+            print(f"Timeout (skipped to next): {len(timeout_quizzes)}")
+            print(f"Skipped (insufficient time): {len(skipped_quizzes)}")
+            print(f"Failed: {len(failed_quizzes)}")
+            print(f"Total Execution Time: {total_time:.2f}s")
+            print(f"Average Time per Quiz: {total_time/len(quiz_chain):.2f}s")
+            print("="*60 + "\n")
+        except Exception as e:
+            logger.error(f"[SUMMARY] Failed to calculate summary statistics: {e}")
+            print("\n" + "="*60)
+            print("QUIZ SOLVER SUMMARY (PARTIAL)")
+            print("="*60)
+            print(f"Total Quizzes: {len(quiz_chain)}")
+            print(f"Summary calculation failed: {e}")
+            print("="*60 + "\n")
         
         # Log final cache statistics
-        quiz_cache.log_stats()
+        try:
+            quiz_cache.log_stats()
+        except Exception as e:
+            logger.error(f"[CACHE_STATS] Failed to log cache stats: {e}")
         
         # Log completion check statistics
-        log_completion_stats()
+        try:
+            log_completion_stats()
+        except Exception as e:
+            logger.error(f"[COMPLETION_STATS] Failed to log completion stats: {e}")
         
         return {
             "success": True,
@@ -1243,7 +1544,19 @@ async def run_pipeline(email: str, url: str) -> Dict[str, Any]:
         }
         
     except Exception as e:
-        logger.error(f"Pipeline execution failed: {e}", exc_info=True)
+        logger.error(f"[PIPELINE_CRITICAL] Pipeline execution failed catastrophically: {e}", exc_info=True)
         import traceback
         traceback.print_exc()
-        return {"success": False, "error": str(e)}
+        
+        # Try to return whatever we have
+        try:
+            return {
+                "success": False, 
+                "error": str(e),
+                "quiz_chain": quiz_chain if 'quiz_chain' in locals() else [],
+                "quiz_runs": {url: qr.to_dict() for url, qr in quiz_runs.items()} if 'quiz_runs' in locals() else {},
+                "partial_results": True
+            }
+        except:
+            return {"success": False, "error": str(e), "catastrophic_failure": True}
+

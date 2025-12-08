@@ -1,6 +1,17 @@
 """
 Test quiz endpoints for local testing
 Provides mock quizzes and data for comprehensive testing
+
+Quiz Chains:
+1. Standard Chain (13 quizzes): literal → compute → web_api → text_extract → file_parse → 
+   multimedia → data_analysis → ml_challenge → js_render → pdf_parse → vision → transform → visualize
+
+2. Advanced Chain (3 quizzes): advanced_1 → advanced_2 → advanced_3
+
+3. Project2 Chain (3 quizzes from mock-tests): project2_csv → project2_orders → project2_f1
+   - project2_csv: Normalize messy CSV with inconsistent date formats
+   - project2_orders: Calculate running totals per customer and find top 3
+   - project2_f1: Compute macro-F1 scores from ML metrics
 """
 import pandas as pd
 import numpy as np
@@ -188,6 +199,42 @@ async def test_quiz(quiz_type: str):
             "code_blocks": [],
             "submit_url": "http://localhost:8080/test-quiz/advanced_3/submit",
             "origin_url": "http://localhost:8080/test-quiz/advanced_3"
+        },
+        
+        # ========== PROJECT2 MOCK TESTS ==========
+        # Additional advanced tests from mock-tests suite
+        
+        "project2_csv": {
+            "text": "Download the messy CSV file and normalize it to JSON format. Convert column names to snake_case (id, name, joined, value), standardize dates to ISO-8601 format (YYYY-MM-DD), ensure values are integers, and sort by id in ascending order. Return as a JSON array.",
+            "links": ["http://localhost:8080/test-data/messy.csv"],
+            "audio_sources": [],
+            "video_sources": [],
+            "image_sources": [],
+            "code_blocks": [],
+            "submit_url": "http://localhost:8080/test-quiz/project2_csv/submit",
+            "origin_url": "http://localhost:8080/test-quiz/project2_csv"
+        },
+        
+        "project2_orders": {
+            "text": "Download the orders CSV file and compute running totals for each customer_id in order_date order. Return the top 3 customers by total amount in JSON format as an array of objects with customer_id and total fields, sorted by total descending.",
+            "links": ["http://localhost:8080/test-data/orders.csv"],
+            "audio_sources": [],
+            "video_sources": [],
+            "image_sources": [],
+            "code_blocks": [],
+            "submit_url": "http://localhost:8080/test-quiz/project2_orders/submit",
+            "origin_url": "http://localhost:8080/test-quiz/project2_orders"
+        },
+        
+        "project2_f1": {
+            "text": "Download the F1 metrics JSON file containing multiple runs with true positives, false positives, and false negatives for each label. Compute the macro-F1 score for each run using the formula F1 = 2*tp / (2*tp + fp + fn), then average across labels. Return a JSON object with the run_id that has the highest macro-F1 score and its macro_f1 value rounded to 4 decimal places.",
+            "links": ["http://localhost:8080/test-data/f1.json"],
+            "audio_sources": [],
+            "video_sources": [],
+            "image_sources": [],
+            "code_blocks": [],
+            "submit_url": "http://localhost:8080/test-quiz/project2_f1/submit",
+            "origin_url": "http://localhost:8080/test-quiz/project2_f1"
         }
     }
     
@@ -362,6 +409,39 @@ Duplicate contact: support@example.com"""
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     
+    # Project2 mock test data files
+    elif filename == "messy.csv":
+        # Messy CSV with inconsistent date formatting
+        csv_content = """ID,Name,Joined,Value
+3,Beta,02/01/24, 10
+1,Alpha,2024-01-30,5
+2,Gamma,1 Feb 2024,7
+"""
+        return Response(content=csv_content, media_type="text/csv")
+    
+    elif filename == "orders.csv":
+        # Orders CSV with customer_id, order_date, and amount
+        csv_content = """customer_id,order_date,amount
+A,2024-01-01,30
+B,2024-01-02,50
+A,2024-01-03,20
+C,2024-01-04,40
+B,2024-01-05,60
+A,2024-01-06,40
+D,2024-01-07,100
+"""
+        return Response(content=csv_content, media_type="text/csv")
+    
+    elif filename == "f1.json":
+        # F1 metrics for multiple runs
+        data = [
+            {"run_id": "runA", "metrics": {"x": {"tp": 8, "fp": 2, "fn": 2}, "y": {"tp": 5, "fp": 3, "fn": 5}}},
+            {"run_id": "runB", "metrics": {"x": {"tp": 9, "fp": 1, "fn": 1}, "y": {"tp": 6, "fp": 4, "fn": 3}}},
+            {"run_id": "runC", "metrics": {"x": {"tp": 7, "fp": 1, "fn": 3}, "y": {"tp": 9, "fp": 2, "fn": 1}}},
+            {"run_id": "runD", "metrics": {"x": {"tp": 6, "fp": 3, "fn": 2}, "y": {"tp": 4, "fp": 2, "fn": 1}}}
+        ]
+        return data
+    
     else:
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found")
 
@@ -446,7 +526,23 @@ async def submit_test_quiz(quiz_type: str, request: Request):
         "advanced_3": {
             "expected": 77.0,  # Predicted exam score for 8.5 hours (y = 7*x + 17.5)
             "tolerance": 3.0,  # Allow ±3 for ML prediction
-            "next": None  # End of advanced chain
+            "next": f"{base_url}/test-quiz/project2_csv"  # Chain to project2 tests
+        },
+        
+        # Project2 mock tests
+        "project2_csv": {
+            "expected": '[{"id":1,"name":"Alpha","joined":"2024-01-30","value":5},{"id":2,"name":"Gamma","joined":"2024-02-01","value":7},{"id":3,"name":"Beta","joined":"2024-02-01","value":10}]',
+            "next": f"{base_url}/test-quiz/project2_orders"
+        },
+        
+        "project2_orders": {
+            "expected": '[{"customer_id":"B","total":110},{"customer_id":"D","total":100},{"customer_id":"A","total":90}]',
+            "next": f"{base_url}/test-quiz/project2_f1"
+        },
+        
+        "project2_f1": {
+            "expected": '{"run_id":"runC","macro_f1":0.8175}',
+            "next": None  # End of chain
         }
     }
     
@@ -464,7 +560,21 @@ async def submit_test_quiz(quiz_type: str, request: Request):
             # For numeric answers, use specified tolerance (or default)
             is_correct = abs(float(answer) - expected) < tolerance
         else:
-            is_correct = str(answer).strip() == str(expected).strip()
+            # Infrastructure: Handle JSON comparison
+            # When expected is a JSON string and answer is a Python object,
+            # serialize answer to compact JSON for comparison
+            import json
+            if isinstance(expected, str) and (expected.startswith('[') or expected.startswith('{')):
+                # Expected is JSON string - serialize answer to JSON for comparison
+                if isinstance(answer, (list, dict)):
+                    answer_json = json.dumps(answer, separators=(',', ':'))
+                    is_correct = answer_json == expected
+                else:
+                    # Answer is already a string - compare directly
+                    is_correct = str(answer).strip() == expected.strip()
+            else:
+                # Simple string comparison
+                is_correct = str(answer).strip() == str(expected).strip()
     except (ValueError, TypeError):
         is_correct = False
     

@@ -541,6 +541,189 @@ prompt = f"... {get_tool_usage_examples()} ..."
 
 ---
 
+### Mistake 14: Over-Relying on Error Messages for Teaching *(NEW - CRITICAL)*
+**What we did:** Added detailed error messages to catch LLM mistakes (wrong column names, invalid operators, etc.)
+**Why it seemed reasonable:** "Error messages teach the LLM what went wrong"
+**Why it's problematic:**
+- Error-driven learning is reactive, not proactive
+- Wastes LLM calls on failed attempts
+- Slower execution (try → fail → retry)
+- Error messages add complexity to implementation
+- Still requires retry logic to recover
+
+**The trap:** Thinking "good error messages = good teaching"
+
+**Better approach - PROACTIVE TEACHING:**
+```python
+# ✅ EXCELLENT - Comprehensive upfront guidance
+"""
+═══════════════════════════════════════════════════════════════════════════
+║               DATAFRAME COLUMN HANDLING - READ THIS FIRST                ║
+═══════════════════════════════════════════════════════════════════════════
+
+STEP 1: EXAMINE DATAFRAME METADATA
+After parsing, you receive: {"columns": ["ID", "Name", "Value"], ...}
+
+STEP 2: USE EXACT COLUMN NAMES (CASE-SENSITIVE)
+- "Value" ≠ "value" ≠ "VALUE"
+- Use names from 'columns' field EXACTLY
+
+STEP 3: CHOOSE THE RIGHT OPERATION
+A) FILTERING: {"op": "filter", "params": {"condition": "Value >= 100"}}
+   - Operators: >= <= > < == !=
+   - Format: "ColumnName operator value"
+   
+COMMON MISTAKES TO AVOID:
+❌ Using lowercase when column is uppercase
+❌ Using SQL-style: "WHERE Value > 100"
+❌ Using unsupported operators: "is", "is not", "AND", "OR"
+
+WORKFLOW PATTERN:
+1. Parse data → Examine columns field
+2. Choose operation based on task
+3. Use EXACT column names from metadata
+"""
+```
+
+**Benefits of proactive teaching:**
+- LLM gets it right on FIRST attempt
+- No wasted LLM calls on failures
+- Faster execution (no retry cycles)
+- Simpler implementation (less error handling)
+- Better user experience (no error delays)
+
+**When error messages are still valuable:**
+- **Validation**: Catch genuinely unexpected edge cases
+- **Debugging**: Help developers identify issues
+- **Safety**: Prevent system crashes
+- **But NOT for**: Teaching basic patterns LLM should know upfront
+
+**The right balance:**
+1. **Primary**: Comprehensive proactive teaching in tool definitions
+2. **Secondary**: Clear validation errors for genuine edge cases
+3. **Never**: Relying on error messages to teach common patterns
+
+**Implementation pattern:**
+```python
+# ✅ GOOD - Proactive teaching prevents mistakes
+"""
+CRITICAL SECTIONS in tool_definitions.py:
+- Visual emphasis (box drawing: ═══, ║)
+- Step-by-step workflows
+- Common mistakes sections with ❌ markers
+- Decision trees for tool selection
+- Explicit format specifications
+- Inline examples showing correct usage
+"""
+
+# ✅ ACCEPTABLE - Validation for edge cases
+if column not in df.columns:
+    raise ValueError(f"Column '{column}' not found. Available: {list(df.columns)}")
+
+# ❌ BAD - Using errors to teach common patterns
+# If LLM commonly makes this mistake, teach it upfront instead!
+if operator == 'is':
+    raise ValueError("Use '==' instead of 'is'. Supported operators: >= <= > < == !=")
+```
+
+**Key metrics:**
+- **Before (error-driven)**: 3-5 iterations, ~30-60s per quiz, complex error handling
+- **After (proactive)**: 1-2 iterations, ~15-30s per quiz, simple validation only
+
+**Lesson:** **Build robust, generalized prompts that teach patterns UPFRONT. Use visual emphasis, decision trees, and step-by-step workflows. Error messages are for validation, not primary teaching. If LLM commonly makes a mistake, improve the proactive teaching instead of relying on error feedback loops.**
+
+---
+
+### Mistake 15: Teaching Without Providing Data *(NEW - CRITICAL)*
+**What we did:** Added extensive prompt instructions about using dataframe data, but didn't provide actual data
+**Example:** 
+```python
+# Prompt said: "Transform ALL the data from {{df_0}}"
+# But call_llm received: "Dataframe with 3 rows, 2 columns. Columns: ['name', 'value']"
+# Result: LLM hallucinated fake data (Alice, Bob, Charlie) instead of transforming real data
+```
+
+**Why it's wrong:**
+- Teaching what to do without providing means to do it
+- Like asking someone to cook without giving ingredients
+- LLM has no choice but to hallucinate or fail
+- No amount of prompt improvement can fix missing data
+
+**The trap:** "We documented the pattern clearly, why isn't it working?"
+
+**Better approach - INFRASTRUCTURE INJECTION:**
+```python
+# ✅ EXCELLENT - Smart data injection in executor.py
+def _prepare_llm_inputs(prompt: str, artifacts: dict) -> str:
+    # Detect artifact references in prompt
+    if '{{df_0}}' in prompt and 'df_0' in artifacts:
+        artifact = artifacts['df_0']
+        if 'dataframe_key' in artifact:
+            # FETCH ACTUAL DATAFRAME
+            df = dataframe_registry.get(artifact['dataframe_key'])
+            # INJECT REAL DATA
+            data_json = df.to_json(orient='records')
+            enhanced_prompt = prompt.replace(
+                'ARTIFACT METADATA',
+                f"Dataframe with {len(df)} rows, {len(df.columns)} columns.\n"
+                f"Columns: {list(df.columns)}\n"
+                f"Data: {data_json}"
+            )
+```
+
+**Benefits of smart injection:**
+- LLM sees actual data, transforms correctly
+- No hallucination possible
+- Works for ANY dataframe, ANY transformation
+- Teaching + data = success on first attempt
+
+**Key distinction:**
+- **Teaching alone**: "Here's how to use data" ❌ (Can't work without data)
+- **Data alone**: Raw data dump ❌ (LLM doesn't know what to do)
+- **Teaching + Smart Injection**: Instructions + actual data ✅ (Complete solution)
+
+**Implementation pattern:**
+```python
+# In tool_definitions.py - TEACHING
+"""
+call_llm - Transform Data Pattern:
+1. Reference dataframe: {{df_0}}
+2. LLM receives the ACTUAL DATA
+3. Transform and return in specified format
+Example: "Convert columns: name→customer_id, value→amount"
+"""
+
+# In executor.py - INFRASTRUCTURE (lines 271-299)
+if tool_name == "call_llm":
+    # Detect dataframe artifacts
+    for artifact_name, artifact_data in artifacts.items():
+        if isinstance(artifact_data, dict) and 'dataframe_key' in artifact_data:
+            # Fetch and inject actual data
+            df = dataframe_registry.get(artifact_data['dataframe_key'])
+            data_json = df.to_json(orient='records', date_format='iso')
+            prompt = enhance_with_data(prompt, artifact_name, df, data_json)
+```
+
+**Real-world impact:**
+- **Before injection**: LLM hallucinated "Alice, Bob, Charlie" ❌
+- **After injection**: LLM transformed actual "Alpha, Gamma, Beta" ✅
+- **Iterations**: 1 (got it right immediately)
+
+**When injection is needed:**
+- ✅ Data transformations (renaming columns, format changes)
+- ✅ Data analysis requiring actual values
+- ✅ Calculations that need real numbers
+- ✅ Pattern detection in actual data
+
+**When injection is NOT needed:**
+- ✅ Metadata operations (column names, data types)
+- ✅ Planning (deciding which operations to perform)
+- ✅ Simple extractions (getting values from JSON/text)
+
+**Lesson:** **Teaching LLM patterns is essential, but if the task requires actual data, infrastructure must inject it. Prompts teach WHAT to do, injection provides MEANS to do it. Both are required for data transformation tasks. No amount of teaching can substitute for missing data.**
+
+---
+
 ## 🚀 Performance Optimizations (That Don't Violate Principles)
 
 ### Optimization 1: Fast Completion Checks ✅

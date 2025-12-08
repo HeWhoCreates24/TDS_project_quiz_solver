@@ -459,7 +459,7 @@ JSON STRUCTURE:
       "id": "task_1",
       "tool_name": "<tool_name>",
       "inputs": {{<tool parameters>}},
-      "produces": [{{"key": "<artifact_name>"}}],
+      "produces": [{{"key": "<artifact_name>"}}],  ← MUST be array of objects with "key" field
       "notes": "<what this task does>"
     }}
   ],
@@ -511,6 +511,70 @@ CRITICAL RULES:
    - final_answer_spec.from: "<artifact_key>" or "<artifact.field>"
    - Use dot notation for nested extraction
 
+7. CALL_LLM PROMPTS - CRITICAL FOR CALCULATIONS:
+   - When using call_llm, include ALL relevant instructions from the quiz text
+   - If quiz provides formulas, include them VERBATIM in the call_llm prompt
+   - If quiz specifies calculation methods, include them EXACTLY in the prompt
+   - For mathematical calculations, REQUIRE STEP-BY-STEP WORK to prevent arithmetic errors
+   - ALWAYS specify exact output format (JSON structure, field names, precision)
+   
+   Example for F1 score calculation:
+   Quiz text: "using formula F1 = 2*tp / (2*tp + fp + fn), then average across labels"
+   
+   call_llm prompt MUST include:
+   "Calculate F1 scores using THIS EXACT FORMULA: F1 = 2*tp / (2*tp + fp + fn)
+   
+   For EACH run in {{{{f1_data}}}}:
+   1. Calculate F1 for label 'x': F1_x = 2*tp / (2*tp + fp + fn)
+   2. Calculate F1 for label 'y': F1_y = 2*tp / (2*tp + fp + fn)
+   3. Calculate macro-F1 = (F1_x + F1_y) / 2
+   4. Round to 4 decimal places
+   
+   Show step-by-step arithmetic for each calculation.
+   
+   Then find which run has the HIGHEST macro-F1.
+   
+   Return ONLY this JSON (no explanations):
+   {{'run_id': 'runX', 'macro_f1': 0.XXXX}}
+   
+   Where runX is the run with highest macro-F1 score."
+   
+   system_prompt: "You are a calculator. Follow formulas exactly. Show all arithmetic steps. Return ONLY the final JSON result with the highest macro-F1 run.
+   
+   For EACH run, show your work step-by-step:
+   1. For EACH label (x, y), calculate: F1 = 2*tp / (2*tp + fp + fn)
+      - Write out the substitution: F1_x = 2*7 / (2*7 + 1 + 3) = 14/18 = 0.7778
+      - Write out the substitution: F1_y = 2*9 / (2*9 + 2 + 1) = 18/21 = 0.8571
+   2. Calculate macro-F1: (F1_x + F1_y) / 2 = (0.7778 + 0.8571) / 2 = 0.8175
+   3. Round to 4 decimal places
+   
+   CRITICAL: Show ALL arithmetic steps to avoid calculation errors!"
+   
+   - The call_llm prompt should be SELF-CONTAINED with all necessary instructions
+   - For multi-step calculations, require showing work at EACH step
+
+8. WHEN QUIZ CONTAINS FORMULAS - CRITICAL:
+   Search the quiz text for mathematical formulas (patterns: "formula", "using", "=", "calculate").
+   
+   IF FOUND: The call_llm prompt is YOUR ONLY CHANCE to tell the LLM how to calculate correctly.
+   
+   MANDATORY PROMPT STRUCTURE:
+   "Here is the data: {{{{artifact_name}}}}
+   
+   Calculate using THIS EXACT FORMULA from the quiz: <copy formula verbatim>
+   
+   For EACH item:
+   1. Substitute actual values: formula = 2*<actual_tp> / (2*<actual_tp> + <actual_fp> + <actual_fn>)
+   2. Show arithmetic: 2*7 / (2*7 + 1 + 3) = 14/18 = 0.7778
+   3. Round to <N> decimal places
+   
+   <If question asks for maximum/minimum>: Compare all results, find highest/lowest
+   
+   Return ONLY JSON: {{'field1': value1, 'field2': value2}}
+   No explanations, no markdown, just the JSON."
+   
+   WHY THIS MATTERS: LLMs make arithmetic errors. Forcing them to show work step-by-step catches mistakes.
+
 {get_tool_usage_examples()}
 """
     
@@ -523,17 +587,37 @@ Audio sources: {page_data.get('audio_sources', [])}
 Image sources: {page_data.get('image_sources', [])}
 HTML preview: {page_data['html'][:500]}...{multimodal_hint}{previous_context}
 
-ANALYZE THIS QUIZ AND GENERATE THE EXECUTION PLAN JSON.
+QUIZ TEXT ANALYSIS:
+Does the quiz text contain a mathematical formula? Search for: "formula", "using", "calculate using", "=" in equations.
+
+IF YES - THIS IS CRITICAL:
+The formula is: [extract the exact formula from quiz text]
+Your call_llm prompt MUST be:
+"Calculate using THIS EXACT FORMULA: [formula copied verbatim]
+
+Data: {{{{{{{{artifact_name}}}}}}}}
+
+For EACH item, show step-by-step:
+1. Substitute values: [formula] = 2*[actual_value] / (2*[actual_value] + [fp_value] + [fn_value])
+2. Calculate: numerator/denominator = result
+3. Round to [N] decimal places
+
+[If finding max/min]: Compare ALL results, return the highest/lowest.
+
+Return ONLY this JSON: {{'field': value}}
+No explanations."
+
+GENERATE THE EXECUTION PLAN JSON:
 
 Requirements:
-1. Extract the submit URL from the page text (look for "submit to:", "POST to:", etc.)
-2. Identify what answer is required (read the instruction text)
-3. IF AUDIO IS PRESENT: Add tasks to download and transcribe it FIRST to get instructions
-4. Determine the answer type (boolean, number, string, json)
-5. Plan minimal tasks needed (often zero if answer is direct)
-6. Build the request_body structure with proper field names
+1. Extract the submit URL from the page text
+2. Identify what answer is required
+3. IF AUDIO: Download and transcribe FIRST
+4. IF FORMULA DETECTED ABOVE: Use the mandatory prompt template in call_llm
+5. Determine answer type
+6. Plan minimal tasks
 
-OUTPUT ONLY THE JSON PLAN, NO OTHER TEXT.
+OUTPUT ONLY THE JSON PLAN.
 """
     
     # Use centralized call_llm

@@ -150,9 +150,14 @@ async def download_file(url: str) -> Dict[str, Any]:
 async def parse_csv_async(path: str = None, url: str = None) -> Dict[str, Any]:
     """Parse CSV file from path or URL (async version)"""
     try:
-        # Determine source
+        # Determine source - handle case where URL is passed as path
         if not path and not url:
             raise ValueError("Either path or url must be provided")
+        
+        # Infrastructure: If path looks like URL, treat it as url
+        if path and (path.startswith('http://') or path.startswith('https://')):
+            url = path
+            path = None
         
         # Cache miss - parse CSV
         quiz_cache.record_miss()
@@ -483,9 +488,9 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
                     op_str = condition.get('operator')
                     val = condition.get('value')
                     
-                    # Validate column exists
+                    # Validate column exists - EXACT match required (case-sensitive)
                     if col not in df.columns:
-                        raise ValueError(f"Column '{col}' not found. Available columns: {list(df.columns)}")
+                        raise ValueError(f"Column '{col}' not found. Available columns: {list(df.columns)}. Column names are CASE-SENSITIVE.")
                     
                     # Direct execution with dict format - more reliable
                     try:
@@ -544,6 +549,14 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
                                 result = df[df[col_name_normalized] == value]
                             elif operator == "!=":
                                 result = df[df[col_name_normalized] != value]
+                            else:
+                                # Invalid operator
+                                available_cols = list(df.columns)
+                                raise ValueError(
+                                    f"Invalid operator '{operator}' in condition: '{condition}'. "
+                                    f"Supported operators: >=, <=, >, <, ==, !=. "
+                                    f"Available columns (CASE-SENSITIVE): {available_cols}"
+                                )
                         else:
                             # Reversed order: value op column
                             # Need to find the column (should be last part)
@@ -568,11 +581,36 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
                                 result = df[df[col_name] == value]
                             elif operator == "!=":
                                 result = df[df[col_name] != value]
+                            else:
+                                # Invalid operator in reversed condition
+                                available_cols = list(df.columns)
+                                raise ValueError(
+                                    f"Invalid operator '{operator}' in condition: '{condition}'. "
+                                    f"Supported operators: >=, <=, >, <, ==, !=. "
+                                    f"Available columns (CASE-SENSITIVE): {available_cols}"
+                                )
                     else:
-                        raise ValueError(f"Invalid condition format: {condition}")
+                        # Provide helpful error for unsupported patterns
+                        available_cols = list(df.columns)
+                        raise ValueError(
+                            f"Invalid condition format: '{condition}'. "
+                            f"Supported format: 'ColumnName operator value' (e.g., 'ID >= 1'). "
+                            f"Operators: >=, <=, >, <, ==, !=. "
+                            f"Available columns (CASE-SENSITIVE): {available_cols}. "
+                            f"Note: Column names must match exactly."
+                        )
             except Exception as e:
                 logger.error(f"Error evaluating condition '{condition}': {e}")
-                raise ValueError(f"Invalid filter condition: {condition}")
+                # Re-raise with helpful context if not already detailed
+                if "Invalid condition format" in str(e) or "Available columns" in str(e):
+                    raise
+                available_cols = list(df.columns)
+                raise ValueError(
+                    f"Filter condition error: '{condition}'. "
+                    f"Error: {str(e)}. "
+                    f"Available columns (CASE-SENSITIVE): {available_cols}. "
+                    f"Use format: 'ColumnName operator value' with operators: >=, <=, >, <, ==, !="
+                )
         else:
             result = df
     elif op == "sum":
@@ -609,7 +647,30 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if not by:
             raise ValueError("groupby requires 'by' parameter (array of column names to group by)")
         
-        result = df.groupby(by).agg(agg)
+        # Support both simple and named aggregation
+        # Simple: {"amount": "sum"} → column stays "amount"
+        # Named: {"total": ["amount", "sum"]} → column renamed to "total" (JSON array)
+        # Named: {"total": ("amount", "sum")} → column renamed to "total" (Python tuple for compatibility)
+        if isinstance(agg, dict):
+            # Check if it's named aggregation (values are tuples/lists) or simple (values are strings)
+            first_value = next(iter(agg.values()))
+            if isinstance(first_value, (tuple, list)):
+                # Named aggregation: {"total": ["amount", "sum"]} or {"total": ("amount", "sum")}
+                # Convert lists to tuples for pandas compatibility
+                converted_agg = {}
+                for key, val in agg.items():
+                    if isinstance(val, list):
+                        converted_agg[key] = tuple(val)  # Convert JSON array to tuple
+                    else:
+                        converted_agg[key] = val  # Already a tuple
+                result = df.groupby(by).agg(**converted_agg)
+            else:
+                # Simple aggregation: {"amount": "sum"}
+                result = df.groupby(by).agg(agg)
+        else:
+            # String aggregation: "count", "sum", etc.
+            result = df.groupby(by).agg(agg)
+        
         # Reset index to make grouped columns accessible as regular columns
         result = result.reset_index()
     elif op == "count":
@@ -638,6 +699,23 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         )
     elif op == "transpose":
         result = df.transpose()
+    elif op == "sort":
+        # Sort dataframe by one or more columns
+        by = params.get("by")  # Can be string or list
+        ascending = params.get("ascending", True)  # Default ascending
+        
+        if not by:
+            raise ValueError("sort requires 'by' parameter (column name or list of column names)")
+        
+        result = df.sort_values(by=by, ascending=ascending)
+    elif op == "head":
+        # Take first N rows
+        n = params.get("n", 5)  # Default 5 rows
+        result = df.head(n)
+    elif op == "tail":
+        # Take last N rows
+        n = params.get("n", 5)  # Default 5 rows
+        result = df.tail(n)
     elif op == "idxmax" or op == "idxmin":
         value_column = params.get("value_column")
         label_column = params.get("label_column")
@@ -659,6 +737,10 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
             result = df.loc[idx].to_dict()
     else:
         raise ValueError(f"Unknown operation: {op}")
+    
+    # Validate result is not None (indicates operation failed)
+    if result is None:
+        raise ValueError(f"Operation '{op}' failed to produce a result. Check parameters: {params}")
     
     if isinstance(result, pd.DataFrame):
         # Thread-safe registry write
