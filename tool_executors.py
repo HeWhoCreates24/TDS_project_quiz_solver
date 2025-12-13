@@ -735,6 +735,22 @@ def dataframe_ops(op: str, params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             # Return the entire row as dict
             result = df.loc[idx].to_dict()
+    elif op == "eval":
+        # Evaluate expression and return scalar result
+        # Example: "(Quantity * UnitPrice).sum()" to calculate total from invoice
+        expression = params.get("expression")
+        if not expression:
+            raise ValueError("eval requires 'expression' parameter (e.g., '(Quantity * UnitPrice).sum()')")
+        
+        try:
+            # Use pandas eval with dataframe context for safe column operations
+            result = df.eval(expression, engine='python')
+            
+            # If result is a Series (from column operations), get scalar if needed
+            if isinstance(result, pd.Series) and len(result) == 1:
+                result = result.iloc[0]
+        except Exception as e:
+            raise ValueError(f"Failed to evaluate expression '{expression}': {e}. Available columns: {list(df.columns)}")
     else:
         raise ValueError(f"Unknown operation: {op}")
     

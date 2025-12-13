@@ -246,18 +246,12 @@ Your reasoning should be brief. Focus on checking what's ALREADY DONE before cal
     logger.info(f"[GENERATE_NEXT_TASKS] Has statistics: {has_statistics}, Has dataframe: {has_dataframe}")
     logger.debug(f"[GENERATE_NEXT_TASKS] Prompt length: {len(prompt)} chars")
 
-    # Force tool usage if we have data but no calculations yet
-    # This prevents the LLM from saying "no tasks needed" when calculations are still required
-    # BUT: Don't force if we already have rendered text with likely answer
-    has_rendered_answer = any(
-        isinstance(v, dict) and 'text' in v and len(str(v.get('text', ''))) > 10
-        for k, v in artifacts.items() 
-        if 'rendered_' in k or 'vision_' in k or 'extracted_' in k
-    )
-    
-    force_tool_usage = has_dataframe and not has_statistics and transcription_text and not has_rendered_answer
-    tool_choice_param = "required" if force_tool_usage else "auto"
-    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (force_reason: df={has_dataframe}, no_stats={not has_statistics}, has_instructions={bool(transcription_text)}, has_rendered_answer={has_rendered_answer})")
+    # REMOVED forced tool usage - violates DESIGN_PRINCIPLES.md
+    # LLM should decide when to call tools based on task requirements, not hardcoded logic
+    # Forcing tools assumes specific workflows (dataframe → statistics) which is overfitting
+    # Let the LLM interpret instructions and choose appropriate tools
+    tool_choice_param = "auto"
+    logger.info(f"[GENERATE_NEXT_TASKS] Tool choice: {tool_choice_param} (LLM decides based on task requirements)")
 
     OPEN_AI_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
     API_KEY = os.getenv("API_KEY")

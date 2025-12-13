@@ -154,43 +154,30 @@ SCRAPING EXAMPLES:
     data_hint = ""
     tool_choice_mode = "auto"
     
-    # Check for images with OCR requirements
-    if has_images and any(kw in page_text_lower for kw in ['ocr', 'read', 'extract', 'number', 'text', 'image']):
+    # Infrastructure: Ensure image data is made available for LLM to work with
+    if has_images:
         image_url = page_data['image_sources'][0]
         logger.info(f"[IMAGE_DETECTED] Page has image source: {image_url}")
         logger.info(f"[PAGE_TEXT] Full text: {page_data['text']}")
         
-        tool_choice_mode = "required"
+        # Inform LLM about available image - let it decide what to do
         data_hint = f"""
 
-🚨 CRITICAL INSTRUCTION - IMAGE OCR TASK 🚨
+📷 IMAGE DATA AVAILABLE:
+The page contains an image file: {image_url}
 
-The page contains an IMAGE file: {image_url}
+To access the image:
+1. download_file to get the image: {{"url": "{image_url}"}}
+2. analyze_image to process it: {{"image_path": "image_data", "task": "ocr"}}
 
-You MUST call these tools in your SINGLE response:
-
-1. download_file
-   Arguments: {{"url": "{image_url}"}}
-   This downloads the image and returns {{"path": "...", "size": ..., "content_type": "image/png"}}
-
-2. analyze_image
-   Arguments: {{"image_path": "image_data", "task": "ocr"}}
-   Use artifact key "image_data" to reference the downloaded image
-   The analyze_image tool will perform OCR to extract text/numbers from the image
-
-IMPORTANT: 
-- Use analyze_image for OCR, NOT call_llm (call_llm cannot process images)
-- Reference the downloaded image artifact by its key ("image_data"), not the path
-- The task parameter should be "ocr" for extracting text/numbers
+Note: Use analyze_image for visual analysis, not call_llm (call_llm cannot process images).
 """
-    # Check for multimedia first - audio often contains instructions
+    # Infrastructure: Ensure audio/data is made available for LLM to work with
     elif has_audio:
         audio_url = page_data['audio_sources'][0]
         logger.info(f"[AUDIO_DETECTED] Page has audio source: {audio_url}")
         logger.info(f"[PAGE_TEXT] Full text: {page_data['text']}")
         logger.info(f"[MULTIMEDIA] Audio sources: {page_data.get('audio_sources', [])}")
-        
-        tool_choice_mode = "required"
         
         csv_link = None
         if has_csv_link:
@@ -198,54 +185,29 @@ IMPORTANT:
         
         data_hint = f"""
 
-🚨 CRITICAL INSTRUCTION - AUDIO + DATA ANALYSIS TASK 🚨
-
-The page contains an AUDIO file: {audio_url}
+🎵 AUDIO DATA AVAILABLE:
+The page contains an audio file: {audio_url}
 {f'The page also contains a CSV file: {csv_link}' if csv_link else ''}
 
-⚠️ THE AUDIO FILE CONTAINS SPOKEN INSTRUCTIONS FOR WHAT TO DO WITH THE DATA ⚠️
+To access the audio:
+1. download_file to get the audio: {{"url": "{audio_url}"}}
+2. transcribe_audio to convert to text: {{"audio_path": "audio_data"}}
 
-You MUST call ALL of these tools in your SINGLE response (we will execute them in sequence):
-
-1. download_file
-   Arguments: {{"url": "{audio_url}"}}
-   This downloads the audio file and returns {{"path": "...", ...}}
-
-2. transcribe_audio
-   Arguments: {{"audio_path": "${{download_file_result_1.path}}"}}
-   Use the path from step 1 to transcribe the audio to text
-
-{f'''3. parse_csv
-   Arguments: {{"url": "{csv_link}"}}
-   Load the CSV data into a dataframe
-
-4. Based on what the transcribed audio says, call the appropriate analysis tool:
-   - If audio says "sum": calculate_statistics with {{"dataframe": "df_0", "stats": ["sum"]}}
-   - If audio says "mean/average": calculate_statistics with {{"dataframe": "df_0", "stats": ["mean"]}}
-   - If audio says "count": calculate_statistics with {{"dataframe": "df_0", "stats": ["count"]}}
-   - If audio says "max/maximum": calculate_statistics with {{"dataframe": "df_0", "stats": ["max"]}}
-   - If audio says "min/minimum": calculate_statistics with {{"dataframe": "df_0", "stats": ["min"]}}''' if csv_link else ''}
-
-IMPORTANT: Call ALL required tools in ONE response. Don't call just download_file - call download_file AND transcribe_audio{' AND parse_csv AND the analysis tool' if csv_link else ''}.
-The answer is NOT the file metadata - it's the result from analyzing the data based on audio instructions.
+The audio may contain instructions for what to do with the data. Let the LLM interpret the transcription.
 """
     elif has_csv_link:
         csv_link = next((link for link in page_data['links'] if '.csv' in str(link).lower()), None)
         logger.info(f"[CSV_DETECTED] Page has CSV link: {csv_link}")
         logger.info(f"[PAGE_TEXT] Full text: {page_data['text']}")
         
-        # Only force CSV analysis if page explicitly asks for it
-        analysis_keywords = ['sum', 'total', 'count', 'average', 'mean', 'filter', 'calculate', 'add up', 'compute']
-        needs_analysis = any(kw in page_text_lower for kw in analysis_keywords)
-        
-        if needs_analysis:
-            tool_choice_mode = "required"
-            data_hint = f"""
+        # Infrastructure: Inform LLM about CSV data availability
+        data_hint = f"""
 
-🚨 CSV DATA ANALYSIS TASK 🚨
-
+📊 CSV DATA AVAILABLE:
 The page contains a CSV file: {csv_link}
-Call parse_csv to load it, then perform the requested analysis.
+
+To access the data, use parse_csv: {{"url": "{csv_link}"}}
+Then interpret the page instructions to determine what analysis is needed.
 """
     
     prompt = f"""
@@ -255,21 +217,16 @@ Code blocks: {page_data['code_blocks']}
 Links: {page_data['links']}
 HTML preview: {page_data['html'][:500]}...{previous_context}{data_hint}
 
-TASK: Determine ALL tools needed to GET the complete answer.
+TASK: Determine what tools (if any) are needed to get the complete answer.
 
-IMPORTANT: If the quiz requires data analysis (sum, filter, count, etc.), you must call:
-1. First tool to load data (parse_csv, parse_excel, etc.)
-2. Second tool to analyze data (calculate_statistics, dataframe_ops, etc.)
+GUIDANCE:
+- If the page says the answer can be "anything" or "any value", no tools needed
+- If there's data to analyze (images, audio, CSV, APIs), use appropriate tools to access it
+- Data loading tools: download_file, parse_csv, parse_excel, render_js_page, fetch_from_api
+- Analysis tools: analyze_image, transcribe_audio, calculate_statistics, dataframe_ops, call_llm
+- Interpret the page instructions to decide which tools and operations are needed
 
-DECISION TREE:
-1. Does the page say the answer can be "anything" or "any value"? → NO TOOLS, just respond with any string
-2. Does the page have an image that needs OCR? → CALL download_file + analyze_image with task="ocr"
-3. Does the page ask to analyze/sum/filter data AND there's a CSV/data file? → CALL parse_csv + calculate_statistics
-4. Does the page have links you need to visit (HTML pages)? → CALL render_js_page for each link
-5. Does the page require computation, calculation, or reasoning to answer? → CALL call_llm with the question
-6. Is the answer a literal value already visible on the page? → NO TOOLS, respond with the answer
-
-Remember: Call ALL tools needed in ONE response. We can execute multiple tools in sequence.
+Remember: You can call multiple tools in ONE response. We execute them in sequence.
 """
 
     OPEN_AI_BASE_URL = os.getenv("LLM_BASE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
@@ -299,9 +256,6 @@ Remember: Call ALL tools needed in ONE response. We can execute multiple tools i
         "temperature": 0,
         "max_tokens": 3000,
     }
-    
-    if tool_choice_mode == "required":
-        logger.info(f"[LLM_TOOLS] Forcing tool usage (tool_choice=required) due to CSV detection")
     
     async with httpx.AsyncClient() as client:
         response = await client.post(OPEN_AI_BASE_URL, headers=headers, json=json_data, timeout=120)
@@ -452,7 +406,7 @@ OUTPUT FORMAT - YOU MUST OUTPUT VALID JSON ONLY:
 
 JSON STRUCTURE:
 {{
-  "submit_url": "<extracted from page text>",
+  "submit_url": "<URL to POST the answer - if page says 'POST to X', use X; if page only mentions 'url=Y', default to /submit endpoint>",
   "origin_url": "<the quiz URL>",
   "tasks": [
     {{

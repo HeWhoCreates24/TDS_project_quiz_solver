@@ -276,38 +276,9 @@ def check_completion_fast(artifacts: Dict[str, Any], page_text: str = "", transc
     has_filtered_df = any('dataframe_ops' in str(k) for k in artifacts.keys())
     has_statistics = any('statistics' in str(v) for v in artifacts.values())
     
-    calc_keywords = ['sum', 'add', 'total', 'mean', 'average', 'count', 'multiply', 'calculate', 'aggregate']
-    filter_keywords = ['greater', 'less', 'equal', 'filter', 'where', 'select', 'cutoff', 'threshold']
-    
-    needs_calculation = any(kw in combined_text for kw in calc_keywords)
-    needs_filter = any(kw in combined_text for kw in filter_keywords)
-    
-    # Pattern 1: Have unfiltered data, need filter first
-    if has_dataframe and not has_filtered_df and needs_filter and needs_calculation:
-        logger.info("[FAST_CHECK] Have dataframe but need filtering before calculation")
-        return {
-            "complete": False,
-            "reason": "Data loaded but filtering not applied yet",
-            "needs_more": True
-        }
-    
-    # Pattern 2: Have filtered data, need calculations
-    if has_filtered_df and needs_calculation and not has_statistics:
-        logger.info("[FAST_CHECK] Have filtered dataframe but need calculations")
-        return {
-            "complete": False,
-            "reason": "Data filtered but calculations not performed yet",
-            "needs_more": True
-        }
-    
-    # Pattern 3: Have any dataframe, need calculations (general case)
-    if has_dataframe and needs_calculation and not has_statistics:
-        logger.info("[FAST_CHECK] Have dataframe but need calculations")
-        return {
-            "complete": False,
-            "reason": "Data loaded but calculations not performed yet",
-            "needs_more": True
-        }
+    # REMOVED quiz-specific keyword detection - violates DESIGN_PRINCIPLES.md
+    # LLM should decide if more operations are needed, not hardcoded keyword matching
+    # This was overfitting to patterns like "cutoff", "sum", etc. from demo quizzes
     
     # Image/PDF processing: have raw file but need processing
     has_image = any('image' in str(v).lower() or '.png' in str(v).lower() or '.jpg' in str(v).lower() for v in artifacts.values())

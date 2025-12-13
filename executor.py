@@ -290,14 +290,15 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
                                 submit_body = inputs["body"]
                                 logger.info(f"[TOOL_EXEC] {task_id}: answer_submit - URL: {submit_url}")
                                 
-                                # URL validation and correction
+                                # URL validation and correction (generic - not quiz-specific)
                                 if isinstance(submit_body, dict) and "url" in submit_body:
                                     body_url = str(submit_body["url"]).strip()
                                     origin_base = origin_url.split('?')[0]
-                                    is_data_endpoint = "/data" in body_url or "/demo-scrape-data" in body_url
+                                    # Generic check: if LLM extracted a placeholder or clearly wrong URL
+                                    is_placeholder = body_url in ["this page's URL", "url", "the url", "quiz url"]
                                     is_wrong_url = body_url and body_url != origin_url and not body_url.startswith(origin_base)
                                     
-                                    if (is_data_endpoint or is_wrong_url or body_url == "this page's URL"):
+                                    if (is_placeholder or is_wrong_url):
                                         logger.info(f"[TOOL_CORRECT] Replacing incorrect URL in body from {body_url} to {origin_url}")
                                         submit_body["url"] = origin_url
                                 
@@ -975,6 +976,10 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
         if hasattr(final_answer, 'item'):
             final_answer = final_answer.item()
         
+        # Replace email placeholder if present
+        if isinstance(final_answer, str) and '<your email>' in final_answer:
+            final_answer = final_answer.replace('<your email>', email)
+        
         if quiz_attempt:
             quiz_attempt.answer = final_answer
         
@@ -1005,8 +1010,20 @@ async def execute_plan(plan_obj: Dict[str, Any], email: str, origin_url: str, pa
         submission_result = await answer_submit(submit_url, submit_body)
         
         if quiz_attempt:
-            quiz_attempt.submission_response = submission_result.get("response", {})
-            quiz_attempt.correct = submission_result.get("response", {}).get("correct", False)
+            # Handle both dict and string submission results
+            if isinstance(submission_result, dict):
+                response_value = submission_result.get("response", {})
+                # The "response" field itself might be a string (HTML error page)
+                if isinstance(response_value, dict):
+                    quiz_attempt.submission_response = response_value
+                    quiz_attempt.correct = response_value.get("correct", False)
+                else:
+                    # response is a string (error HTML)
+                    quiz_attempt.submission_response = {"error": str(response_value)}
+                    quiz_attempt.correct = False
+            else:
+                quiz_attempt.submission_response = {"error": str(submission_result)}
+                quiz_attempt.correct = False
         
         return {
             "success": True,
@@ -1213,6 +1230,23 @@ async def run_pipeline(email: str, url: str, manual_override_queue: list = None)
                     
                     try:
                         plan_obj = json.loads(plan_json)
+                        
+                        # CRITICAL FIX: Default submit_url to /submit if LLM extracted the quiz URL instead
+                        # The quiz instructions say "POST to /submit" but LLM often confuses quiz URL with submit URL
+                        submit_url = plan_obj.get("submit_url", "")
+                        
+                        # If submit_url doesn't contain "/submit", it's likely a quiz page URL - fix it
+                        if submit_url and "/submit" not in submit_url:
+                            # Parse base domain from current_url (always full URL) to build correct submit URL
+                            from urllib.parse import urlparse
+                            parsed = urlparse(current_url)
+                            base_url = f"{parsed.scheme}://{parsed.netloc}"
+                            expected_submit = f"{base_url}/submit"
+                            
+                            logger.warning(f"[PLAN_FIX] LLM extracted non-submit URL: {submit_url}")
+                            logger.warning(f"[PLAN_FIX] Correcting to: {expected_submit}")
+                            plan_obj["submit_url"] = expected_submit
+                        
                     except json.JSONDecodeError as e:
                         logger.error(f"[QUIZ_RUN] Failed to parse plan JSON: {e}")
                         logger.error(f"[QUIZ_RUN] Raw plan response: {plan_response[:500]}...")
@@ -1228,8 +1262,14 @@ async def run_pipeline(email: str, url: str, manual_override_queue: list = None)
                 except Exception as e:
                     logger.error(f"[QUIZ_RUN] CRITICAL: Failed to generate plan: {e}")
                     logger.warning(f"[QUIZ_RUN] Creating emergency fallback plan")
+                    
+                    # Build correct submit URL from current_url base domain
+                    from urllib.parse import urlparse
+                    parsed = urlparse(current_url)
+                    base_submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
+                    
                     plan_obj = {
-                        "submit_url": page_data.get("submit_url", f"{current_url}/submit"),
+                        "submit_url": page_data.get("submit_url", base_submit_url),
                         "origin_url": current_url,
                         "tasks": [],
                         "final_answer_spec": {"type": "string", "from": "ERROR: Plan generation failed"},
@@ -1278,6 +1318,9 @@ async def run_pipeline(email: str, url: str, manual_override_queue: list = None)
                 # Check submission response
                 submission_response = execution_result.get("submission_result", {})
                 response_data = submission_response.get("response", {}) if submission_response else {}
+                # Handle string response (error case)
+                if isinstance(response_data, str):
+                    response_data = {"correct": False, "message": response_data}
                 
                 # If no submission happened (execution failed), try emergency submission
                 if not submission_response:
@@ -1293,6 +1336,9 @@ async def run_pipeline(email: str, url: str, manual_override_queue: list = None)
                         }
                         emergency_response = await answer_submit(submit_url, submit_body)
                         response_data = emergency_response.get("response", {})
+                        # Handle string response (error case)
+                        if isinstance(response_data, str):
+                            response_data = {"correct": False, "message": response_data}
                         logger.info(f"[QUIZ_SUBMISSION] Emergency submission completed: {response_data}")
                     except Exception as e:
                         logger.error(f"[QUIZ_SUBMISSION] Emergency submission also failed: {e}")
@@ -1399,6 +1445,27 @@ async def run_pipeline(email: str, url: str, manual_override_queue: list = None)
                         remaining_time = max_retry_time - elapsed_time
                         
                         logger.info(f"[QUIZ_RETRY] Answer was incorrect. Elapsed: {elapsed_time:.1f}s, Avg per attempt: {avg_time:.1f}s, Remaining: {remaining_time:.1f}s, Attempts: {quiz_attempt.attempt_number}")
+                        
+                        # Check if next quiz URL exists (difficulty 1-2 always reveal next URL)
+                        has_next_url = "url" in response_data and response_data["url"] and response_data["url"] != current_url
+                        max_attempts = 10 if has_next_url else 999  # Limit to 10 attempts if next quiz available
+                        
+                        # Hard limit on attempts when next quiz available
+                        if has_next_url and quiz_attempt.attempt_number >= max_attempts:
+                            logger.warning(f"[QUIZ_RETRY_SKIP] Reached max attempts ({max_attempts}) with next quiz available. Skipping to next quiz.")
+                            next_url = response_data["url"]
+                            logger.info(f"[QUIZ_RETRY_SKIP] Skipping to next quiz: {next_url}")
+                            
+                            quiz_chain.append({
+                                "quiz_url": current_url,
+                                "quiz_run": quiz_run.to_dict(),
+                                "skipped": True,
+                                "reason": f"Max attempts reached ({max_attempts})"
+                            })
+                            
+                            # Move to next quiz
+                            current_url = next_url
+                            break  # Break inner retry loop to start new quiz
                         
                         # Smart retry: check if average time per attempt < remaining time
                         if quiz_run.can_retry_smart(max_retry_time):

@@ -71,6 +71,9 @@ After parsing, you get metadata like:
 ┌─ I need: Total/average of a column
 │  └─ Use: dataframe_ops(op="sum"/"mean", params={"column": "Value"})
 │
+┌─ I need: Calculated total (e.g., sum of Quantity × Price for each row)
+│  └─ Use: dataframe_ops(op="eval", params={"expression": "(Quantity * UnitPrice).sum()"})
+│
 ┌─ I need: Per-group totals (e.g., sum by category)
 │  └─ Use: dataframe_ops(op="groupby", params={"by": ["Category"], "aggregation": {"Value": "sum"}})
 │
@@ -927,8 +930,8 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                     "properties": {
                         "op": {
                             "type": "string",
-                            "description": "Operation to perform. Choose based on goal: 'filter' for row subsets, 'select' for column subsets, 'sum'/'mean' for single values, 'groupby' for per-category aggregation, 'pivot' for reshaping, 'idxmax'/'idxmin' for finding extreme values",
-                            "enum": ["filter", "sum", "mean", "count", "select", "groupby", "pivot", "melt", "transpose", "sort", "head", "tail", "idxmax", "idxmin"]
+                            "description": "Operation to perform. Choose based on goal: 'filter' for row subsets, 'select' for column subsets, 'sum'/'mean' for single values, 'groupby' for per-category aggregation, 'pivot' for reshaping, 'idxmax'/'idxmin' for finding extreme values, 'eval' for calculated expressions like (Column1 * Column2).sum()",
+                            "enum": ["filter", "sum", "mean", "count", "select", "groupby", "pivot", "melt", "transpose", "sort", "head", "tail", "idxmax", "idxmin", "eval"]
                         },
                         "params": {
                             "type": "object",
@@ -1007,6 +1010,10 @@ def get_tool_definitions() -> List[Dict[str, Any]]:
                                 "label_column": {
                                     "type": "string",
                                     "description": "FOR IDXMAX/IDXMIN ONLY. Column to extract value from in the row with max/min. Returns the label/name, not the max/min value itself. Example: Find region with highest revenue → value_column='Revenue', label_column='Region' → returns region name like 'West'."
+                                },
+                                "expression": {
+                                    "type": "string",
+                                    "description": "FOR EVAL ONLY. Pandas expression to evaluate on the DataFrame. Supports column operations and aggregations. Use for calculated totals like row-wise products summed. Example: '(Quantity * UnitPrice).sum()' calculates quantity×price for each row then sums total. Must use EXACT column names from metadata (case-sensitive). Returns single value or Series."
                                 }
                             },
                             "required": ["dataframe_key"]
